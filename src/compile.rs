@@ -49,8 +49,11 @@ fn get_processor_subcircuits(circ: Circuit, max_size: usize) -> Vec<Circuit> {
         .map(GateId)
         .filter(|id| in_degree[id.0] == 0)
         .collect();
-    let mut assigned = vec![false; n];
     let mut gates: Vec<Option<Gate<Qubit>>> = circ.gates.into_iter().map(Some).collect();
+    // Precompute once; avoids repeated Vec allocation inside the hot inner loop.
+    let gate_qubits: Vec<Vec<Qubit>> = gates.iter()
+        .map(|g| g.as_ref().unwrap().qubits())
+        .collect();
     let mut subcircuits: Vec<Circuit> = Vec::new();
     let mut total_assigned = 0;
 
@@ -62,27 +65,25 @@ fn get_processor_subcircuits(circ: Circuit, max_size: usize) -> Vec<Circuit> {
         while made_progress {
             made_progress = false;
 
-            let gate_qubits = |id: &GateId| -> HashSet<Qubit> {
-                gates[id.0].as_ref().unwrap().qubits().into_iter().collect()
-            };
-            let fits = |id: &&GateId| active_qubits.union(&gate_qubits(id)).count() <= max_size;
-            let new_qubit_cost = |id: &&GateId| {
-                let gq = gate_qubits(id);
-                (gq.difference(&active_qubits).count(), id.0)
-            };
+            // Compute new_qubit_cost once per candidate (was computed twice before).
+            // Gates absent from `ready` are already assigned, so no assigned[] check needed.
             let best = ready
                 .iter()
-                .filter(|id| !assigned[id.0])
-                .filter(fits)
-                .min_by_key(new_qubit_cost)
-                .copied();
+                .filter_map(|id| {
+                    let gq = &gate_qubits[id.0];
+                    let new = gq.iter().filter(|q| !active_qubits.contains(q)).count();
+                    if active_qubits.len() + new <= max_size {
+                        Some((*id, new))
+                    } else {
+                        None
+                    }
+                })
+                .min_by_key(|&(id, new)| (new, id.0))
+                .map(|(id, _)| id);
 
             if let Some(id) = best {
-                let gate_qubits: HashSet<Qubit> =
-                    gates[id.0].as_ref().unwrap().qubits().into_iter().collect();
-                active_qubits.extend(gate_qubits);
+                active_qubits.extend(gate_qubits[id.0].iter().copied());
                 subcircuit_gates.push(gates[id.0].take().unwrap());
-                assigned[id.0] = true;
                 ready.remove(&id);
                 total_assigned += 1;
                 made_progress = true;
@@ -289,6 +290,21 @@ fn ls_circuit_op_to_pbc_op(op: LoadStoreOp) -> Vec<PauliProductOperation> {
     }
 }
 
+/// Returns true if every qubit key in `sub` appears in `sup`.
+/// Both slices must be sorted by qubit (PauliString invariant), so this is O(n+m), no allocation.
+fn qubit_keys_subset(sub: &[(ArchitectureQubit, Pauli)], sup: &[(ArchitectureQubit, Pauli)]) -> bool {
+    let mut j = 0;
+    for &(q, _) in sub {
+        while j < sup.len() && sup[j].0 < q {
+            j += 1;
+        }
+        if j >= sup.len() || sup[j].0 != q {
+            return false;
+        }
+    }
+    true
+}
+
 fn absorb_into_measurement(circ: PauliProductCircuit) -> PauliProductCircuit {
     let mut instructions = Vec::new();
 
@@ -337,14 +353,13 @@ fn absorb_into_measurement(circ: PauliProductCircuit) -> PauliProductCircuit {
                         axis.pauli_string = product_axis.pauli_string;
                     }
                 }
-                let meas_qubits: HashSet<ArchitectureQubit> =
-                    axis.pauli_string.iter().map(|&(q, _)| q).collect();
                 instructions.push(PauliProductOperation::Measurement(axis));
-                pending.retain(|rot| {
-                    let rot_qubits: HashSet<ArchitectureQubit> =
-                        rot.pauli_string.iter().map(|&(q, _)| q).collect();
-                    !rot_qubits.is_subset(&meas_qubits)
-                });
+                // PauliStrings are sorted, so we can do a zero-alloc linear subset check.
+                let meas_ps = match instructions.last().unwrap() {
+                    PauliProductOperation::Measurement(a) => a.pauli_string.as_ref(),
+                    _ => unreachable!(),
+                };
+                pending.retain(|rot| !qubit_keys_subset(&rot.pauli_string, meas_ps));
             }
         }
     }
@@ -362,8 +377,8 @@ fn to_pauli_product_circuit(load_store: LoadStoreCircuit) -> PauliProductCircuit
 
 fn to_load_store_circuit(subcircuits: Vec<Circuit>) -> LoadStoreCircuit {
     let mut ops = Vec::new();
-    let mut circuit_to_processor_qubit: HashMap<Qubit, ArchitectureQubit> = HashMap::new();
     for sub in subcircuits {
+        let mut circuit_to_processor_qubit: HashMap<Qubit, ArchitectureQubit> = HashMap::new();
         let mut loaded_count = 0;
         let mut sorted_qubits: Vec<_> = sub.qubits.iter().collect();
         sorted_qubits.sort_unstable_by_key(|q| q.0);

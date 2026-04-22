@@ -59,7 +59,7 @@ fn main() {
         ),
         None => match cli.mem_cap {
             Some(mem) => (mem, cli.proc_cap.unwrap()),
-            None => (BALANCED_LP_20.memory_capacity, BALANCED_LP_20.processor_capacity),
+            None => (SPACE_EFFICIENT_LP_20.memory_capacity, SPACE_EFFICIENT_LP_20.processor_capacity),
         },
     };
 
@@ -86,7 +86,7 @@ fn main() {
         let writes = [
             ("load_store.txt", load_store.to_string()),
             ("pbc_w_clifford.txt", pbc_pre.to_string()),
-            ("pbc_final.txt", pbc_final.to_string()),
+            ("final_res.txt", pbc_final.to_string()),
         ];
         for (name, content) in writes {
             fs::write(dir.join(name), content).unwrap_or_else(|e| {
@@ -94,7 +94,6 @@ fn main() {
                 process::exit(1);
             });
         }
-        println!("{pbc_final}");
     } else {
         println!("{}", compile(circuit, proc_cap));
     }
