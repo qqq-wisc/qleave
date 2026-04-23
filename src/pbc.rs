@@ -1,9 +1,112 @@
 use std::fmt;
+
+/// A stable identifier for a measurement outcome (classical bit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MeasId(pub u32);
+
+/// A conjunction of measurement outcomes: satisfied when ALL listed bits are 1.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AllOf(pub Vec<MeasId>); // kept sorted
+
+impl AllOf {
+    pub fn single(id: MeasId) -> Self {
+        Self(vec![id])
+    }
+
+    pub fn and(mut self, id: MeasId) -> Self {
+        if let Err(pos) = self.0.binary_search(&id) {
+            self.0.insert(pos, id);
+        }
+        self
+    }
+}
+
+/// Pre-computed truth table of measurement axes indexed by measurement outcome patterns.
+///
+/// `conditions` lists all distinct MeasIds that influence this measurement.
+/// `axes[mask]` is the physical gadget (axis) to use when bit `i` of `mask` equals whether
+/// `conditions[i]` is 1.  An unconditional measurement has `conditions = []`, `axes = [base]`.
+#[derive(Clone, Debug)]
+pub struct ConditionedAxis {
+    pub conditions: Vec<MeasId>, // sorted; one per bit dimension of the truth table
+    pub axes: Vec<PauliAxis>,    // len == 1 << conditions.len()
+}
+
+impl ConditionedAxis {
+    pub fn unconditional(base: PauliAxis) -> Self {
+        Self {
+            conditions: vec![],
+            axes: vec![base],
+        }
+    }
+}
+
+/// Build the truth table for a measurement axis given a base and a list of conditional
+/// Clifford corrections.  Each correction `(AllOf(bits), factor)` is applied (multiplied
+/// into the axis) for every truth-table row where ALL bits in `bits` are set.
+pub fn build_conditioned_axis(base: PauliAxis, corrections: &[(AllOf, PauliAxis)]) -> ConditionedAxis {
+    if corrections.is_empty() {
+        return ConditionedAxis::unconditional(base);
+    }
+
+    // Collect all distinct MeasIds referenced across all conditions.
+    let mut all_ids: Vec<MeasId> = corrections
+        .iter()
+        .flat_map(|(allof, _)| allof.0.iter().copied())
+        .collect();
+    all_ids.sort_unstable();
+    all_ids.dedup();
+
+    let k = all_ids.len();
+    let n = 1usize << k;
+
+    // Initialize all rows with the base axis.
+    let mut axes: Vec<PauliAxis> = (0..n).map(|_| base.clone()).collect();
+
+    // For each row (bit assignment), apply corrections whose conditions are fully satisfied.
+    for mask in 0..n {
+        for (allof, factor) in corrections {
+            let all_set = allof.0.iter().all(|id| {
+                let bit = all_ids.binary_search(id).unwrap();
+                (mask >> bit) & 1 == 1
+            });
+            if all_set {
+                let ax = &axes[mask];
+                let product = pauli_string_mult(&factor.pauli_string, &ax.pauli_string);
+                axes[mask] = PauliAxis {
+                    sign: factor.sign * ax.sign * product.sign * Sign::J,
+                    pauli_string: product.pauli_string,
+                };
+            }
+        }
+    }
+
+    ConditionedAxis {
+        conditions: all_ids,
+        axes,
+    }
+}
+
 #[derive(Clone)]
 pub struct PauliProductCircuit {
     pub instructions: Vec<PauliProductOperation>,
+    pub(crate) next_meas_id: u32,
 }
 
+impl PauliProductCircuit {
+    pub fn new() -> Self {
+        Self {
+            instructions: Vec::new(),
+            next_meas_id: 0,
+        }
+    }
+
+    pub fn allocate_meas_id(&mut self) -> MeasId {
+        let id = MeasId(self.next_meas_id);
+        self.next_meas_id += 1;
+        id
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Hash, Copy, PartialOrd, Ord, Debug)]
 pub enum ArchitectureQubit {
@@ -150,7 +253,10 @@ pub struct PauliAxis {
 #[derive(Clone, Debug)]
 pub enum PauliProductOperation {
     Rotation { axis: PauliAxis, angle: PPRAngle },
-    Measurement(PauliAxis),
+    /// Classically-controlled Clifford correction: apply iff ALL bits in condition are 1.
+    /// Only PiOver4 (Clifford) angles are meaningful here; PiOver2 corrections are software-only.
+    ConditionalRotation { axis: PauliAxis, angle: PPRAngle, condition: AllOf },
+    Measurement { axis: ConditionedAxis, id: MeasId },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -228,11 +334,68 @@ impl fmt::Display for PPRAngle {
     }
 }
 
+impl fmt::Display for MeasId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "m{}", self.0)
+    }
+}
+
+impl fmt::Display for AllOf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.as_slice() {
+            [] => write!(f, "never"),
+            [id] => write!(f, "{id}"),
+            ids => {
+                write!(f, "(")?;
+                for (i, id) in ids.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "∧")?;
+                    }
+                    write!(f, "{id}")?;
+                }
+                write!(f, ")")
+            }
+        }
+    }
+}
+
+impl fmt::Display for ConditionedAxis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.conditions.is_empty() {
+            // Unconditional: just show the axis.
+            write!(f, "{}", self.axes[0])
+        } else {
+            // Show the truth table: "base | mask→axis ..."
+            write!(f, "{}", self.axes[0])?;
+            let k = self.conditions.len();
+            for mask in 1..(1usize << k) {
+                // Describe which condition bits are set.
+                write!(f, " | ")?;
+                let mut first = true;
+                for i in 0..k {
+                    if (mask >> i) & 1 == 1 {
+                        if !first {
+                            write!(f, "∧")?;
+                        }
+                        write!(f, "{}", self.conditions[i])?;
+                        first = false;
+                    }
+                }
+                write!(f, "→{}", self.axes[mask])?;
+            }
+            Ok(())
+        }
+    }
+}
+
 impl fmt::Display for PauliProductOperation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PauliProductOperation::Rotation { axis, angle } => write!(f, "R({angle}, {axis})"),
-            PauliProductOperation::Measurement(axis) => write!(f, "Meas({axis})"),
+            PauliProductOperation::ConditionalRotation { axis, angle, condition } => {
+                write!(f, "R({angle}, {axis}) if {condition}")
+            }
+            PauliProductOperation::Measurement { axis, id } => write!(f, "[{id}] Meas({axis})"),
         }
     }
 }
