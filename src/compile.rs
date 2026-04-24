@@ -1,10 +1,9 @@
 use crate::circuit::{Circuit, Gate, GateId, Qubit, shift_register_hashmap};
 use crate::pbc::{
-    AllOf, ArchitectureQubit, MeasId,
+    AllOf, ArchitectureQubit, CliffordFrame, MeasId,
     PPRAngle::{PiOver2, PiOver4, PiOver8},
-    Pauli, PauliAxis, PauliProductCircuit, PauliProductOperation, PauliString, Sign,
+    Pauli, PauliAxis, PauliProductCircuit, PauliProductOperation, PauliString,
     Sign::{NegOne, One},
-    axes_commute, build_conditioned_axis, pauli_string_mult,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -65,9 +64,6 @@ fn get_processor_subcircuits(circ: Circuit, max_size: usize) -> Vec<Circuit> {
 
         while made_progress {
             made_progress = false;
-
-            // Compute new_qubit_cost once per candidate (was computed twice before).
-            // Gates absent from `ready` are already assigned, so no assigned[] check needed.
             let best = ready
                 .iter()
                 .filter_map(|id| {
@@ -186,13 +182,13 @@ fn gate_to_pbc_instructions(
             let m1 = alloc();
             vec![
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![
                             (*q, Pauli::Z),
                             (ArchitectureQubit::Magic(0), Pauli::X),
                         ]),
-                    }),
+                    },
                     id: m0,
                 },
                 // S correction on q conditioned on m0 (Clifford correction for T-gate injection).
@@ -205,13 +201,13 @@ fn gate_to_pbc_instructions(
                     condition: AllOf::single(m0),
                 },
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![(
                             ArchitectureQubit::Magic(0),
                             Pauli::X,
                         )]),
-                    }),
+                    },
                     id: m1,
                 },
                 // Disentangle magic
@@ -230,13 +226,13 @@ fn gate_to_pbc_instructions(
             let m1 = alloc();
             vec![
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: NegOne,
                         pauli_string: PauliString::new(vec![
                             (*q, Pauli::Z),
                             (ArchitectureQubit::Magic(0), Pauli::X),
                         ]),
-                    }),
+                    },
                     id: m0,
                 },
                 // S correction on q conditioned on m0.
@@ -249,13 +245,13 @@ fn gate_to_pbc_instructions(
                     condition: AllOf::single(m0),
                 },
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![(
                             ArchitectureQubit::Magic(0),
                             Pauli::X,
                         )]),
-                    }),
+                    },
                     id: m1,
                 },
                 // Disentangle magic
@@ -306,33 +302,33 @@ fn gate_to_pbc_instructions(
             let m5 = alloc(); // X[Magic2]
             vec![
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![
                             (*control1, Pauli::Z),
                             (ArchitectureQubit::Magic(0), Pauli::X),
                         ]),
-                    }),
+                    },
                     id: m0,
                 },
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![
                             (*control2, Pauli::Z),
                             (ArchitectureQubit::Magic(1), Pauli::X),
                         ]),
-                    }),
+                    },
                     id: m1,
                 },
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![
                             (*target, Pauli::Z),
                             (ArchitectureQubit::Magic(2), Pauli::X),
                         ]),
-                    }),
+                    },
                     id: m2,
                 },
                 // conditional cz ctrl2, tar
@@ -420,33 +416,33 @@ fn gate_to_pbc_instructions(
                     condition: AllOf(vec![m1]),
                 },
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![(
                             ArchitectureQubit::Magic(0),
                             Pauli::X,
                         )]),
-                    }),
+                    },
                     id: m3,
                 },
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![(
                             ArchitectureQubit::Magic(1),
                             Pauli::X,
                         )]),
-                    }),
+                    },
                     id: m4,
                 },
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![(
                             ArchitectureQubit::Magic(2),
                             Pauli::X,
                         )]),
-                    }),
+                    },
                     id: m5,
                 },
                 PauliProductOperation::ConditionalRotation {
@@ -490,11 +486,12 @@ fn ls_circuit_op_to_pbc_op(op: LoadStoreOp, next_id: &mut u32) -> Vec<PauliProdu
             let m0 = alloc();
             let m1 = alloc();
             vec![
+                PauliProductOperation::FrameReset(proc),
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![(mem, Pauli::Z), (proc, Pauli::Z)]),
-                    }),
+                    },
                     id: m0,
                 },
                 PauliProductOperation::ConditionalRotation {
@@ -506,10 +503,10 @@ fn ls_circuit_op_to_pbc_op(op: LoadStoreOp, next_id: &mut u32) -> Vec<PauliProdu
                     condition: AllOf(vec![m0]),
                 },
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![(mem, Pauli::X)]),
-                    }),
+                    },
                     id: m1,
                 },
                 PauliProductOperation::ConditionalRotation {
@@ -527,10 +524,10 @@ fn ls_circuit_op_to_pbc_op(op: LoadStoreOp, next_id: &mut u32) -> Vec<PauliProdu
             let m1 = alloc();
             vec![
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![(proc, Pauli::Z), (mem, Pauli::Z)]),
-                    }),
+                    },
                     id: m0,
                 },
                 PauliProductOperation::ConditionalRotation {
@@ -542,10 +539,10 @@ fn ls_circuit_op_to_pbc_op(op: LoadStoreOp, next_id: &mut u32) -> Vec<PauliProdu
                     condition: AllOf(vec![m0]),
                 },
                 PauliProductOperation::Measurement {
-                    axis: crate::pbc::ConditionedAxis::unconditional(PauliAxis {
+                    axis: PauliAxis {
                         sign: One,
                         pauli_string: PauliString::new(vec![(proc, Pauli::X)]),
-                    }),
+                    },
                     id: m1,
                 },
                 PauliProductOperation::ConditionalRotation {
@@ -562,147 +559,49 @@ fn ls_circuit_op_to_pbc_op(op: LoadStoreOp, next_id: &mut u32) -> Vec<PauliProdu
     }
 }
 
-/// Returns true if every qubit key in `sub` appears in `sup`.
-/// Both slices must be sorted by qubit (PauliString invariant), so this is O(n+m), no allocation.
-fn qubit_keys_subset(
-    sub: &[(ArchitectureQubit, Pauli)],
-    sup: &[(ArchitectureQubit, Pauli)],
-) -> bool {
-    let mut j = 0;
-    for &(q, _) in sub {
-        while j < sup.len() && sup[j].0 < q {
-            j += 1;
-        }
-        if j >= sup.len() || sup[j].0 != q {
-            return false;
-        }
-    }
-    true
-}
-
-fn absorb_into_measurement(circ: PauliProductCircuit) -> PauliProductCircuit {
+fn absorb_cliffords(circ: PauliProductCircuit) -> PauliProductCircuit {
     let mut result = PauliProductCircuit::new();
     result.next_meas_id = circ.next_meas_id;
-
-    let mut pending: Vec<PauliAxis> = Vec::new();
-    // Conditional Clifford (PiOver4) corrections pending absorption into the next measurement.
-    let mut conditional_pending: Vec<(PauliAxis, AllOf)> = Vec::new();
+    let mut frame = CliffordFrame::new();
 
     for instr in circ.instructions {
         match instr {
+            PauliProductOperation::FrameReset(q) => {
+                frame.reset(q);
+            }
             PauliProductOperation::Rotation {
                 axis,
                 angle: PiOver4,
             } => {
-                pending.push(axis);
+                frame.update(&axis);
             }
             PauliProductOperation::Rotation {
                 axis,
                 angle: PiOver2,
             } => {
-                let copy = axis.clone();
-                pending.push(axis);
-                pending.push(copy);
+                frame.update(&axis);
+                frame.update(&axis);
             }
             PauliProductOperation::Rotation {
                 axis,
                 angle: PiOver8,
             } => {
-                eprintln!(
-                    "Warning: π/8 rotations cannot be absorbed into measurements and will be emitted as separate instructions."
-                );
                 result.instructions.push(PauliProductOperation::Rotation {
-                    axis,
+                    axis: frame.apply(&axis),
                     angle: PiOver8,
                 });
             }
-
-            // Conditional Clifford corrections go to conditional_pending.
-            PauliProductOperation::ConditionalRotation {
-                axis,
-                angle: PiOver4,
-                condition,
-            } => {
-                conditional_pending.push((axis, condition));
+            PauliProductOperation::ConditionalRotation { .. } => {
+                // Dropped for now.
             }
-            // Pauli corrections (PiOver2) are software-only
-            PauliProductOperation::ConditionalRotation {
-                axis,
-                angle: PiOver2,
-                condition,
-            } => {
-                let (axis_copy, condition_copy) = (axis.clone(), condition.clone());
-                conditional_pending.push((axis, condition));
-                conditional_pending.push((axis_copy, condition_copy))
-            }
-            PauliProductOperation::ConditionalRotation {
-                axis,
-                angle: PiOver8,
-                condition,
-            } => {
-                eprintln!(
-                    "Warning: conditional π/8 rotation cannot be absorbed and will be emitted as-is."
-                );
-                result
-                    .instructions
-                    .push(PauliProductOperation::ConditionalRotation {
-                        axis,
-                        angle: PiOver8,
-                        condition,
-                    });
-            }
-
-            PauliProductOperation::Measurement { mut axis, id } => {
-                // Step 1: absorb unconditional pending into the base axis (all cases).
-                // Apply to all rows of the truth table uniformly.
-                for row_axis in axis.axes.iter_mut() {
-                    for to_absorb in pending.iter().rev() {
-                        let p = &to_absorb.pauli_string;
-                        let q = &row_axis.pauli_string;
-                        if !axes_commute(p, q) {
-                            let product_axis = pauli_string_mult(p, q);
-                            row_axis.sign =
-                                row_axis.sign * to_absorb.sign * product_axis.sign * Sign::J;
-                            row_axis.pauli_string = product_axis.pauli_string;
-                        }
-                    }
-                }
-
-                // Step 2: collect conditional corrections that apply to this measurement.
-                // A correction applies if its qubit support is within the measurement's base qubit support.
-                let base_ps = axis.axes[0].pauli_string.as_ref();
-                let mut corrections: Vec<(AllOf, PauliAxis)> = Vec::new();
-                let mut still_pending_conditional: Vec<(PauliAxis, AllOf)> = Vec::new();
-
-                for (factor, cond) in conditional_pending.drain(..) {
-                    if qubit_keys_subset(&factor.pauli_string, base_ps) {
-                        // Within measurement support — check if it anti-commutes with the base.
-                        if !axes_commute(&factor.pauli_string, &axis.axes[0].pauli_string) {
-                            corrections.push((cond, factor));
-                        }
-                        // Commuting corrections within support are consumed without effect.
-                    } else {
-                        still_pending_conditional.push((factor, cond));
-                    }
-                }
-                conditional_pending = still_pending_conditional;
-
-                // Step 3: if there are conditional corrections, rebuild the truth table.
-                if !corrections.is_empty() {
-                    // The current axis (after unconditional absorption) serves as the base.
-                    // Since unconditional absorption updated all rows uniformly (and the input
-                    // measurement was unconditional at this point), axes[0] is the base.
-                    let base = axis.axes[0].clone();
-                    axis = build_conditioned_axis(base, &corrections);
-                }
-
+            PauliProductOperation::Measurement { axis, id } => {
+                let effective = frame.apply(&axis);
                 result
                     .instructions
                     .push(PauliProductOperation::Measurement {
-                        axis: axis.clone(),
+                        axis: effective,
                         id,
                     });
-
             }
         }
     }
@@ -712,16 +611,43 @@ fn absorb_into_measurement(circ: PauliProductCircuit) -> PauliProductCircuit {
 
 fn to_pauli_product_circuit(
     load_store: LoadStoreCircuit,
-    emit_corrections: bool,
+    simulate_corrections: bool,
 ) -> PauliProductCircuit {
     let mut circuit = PauliProductCircuit::new();
     for op in load_store.ops {
         let instrs = ls_circuit_op_to_pbc_op(op, &mut circuit.next_meas_id);
         circuit.instructions.extend(instrs.into_iter().filter(|i| {
-            emit_corrections || !matches!(i, PauliProductOperation::ConditionalRotation { .. })
+            simulate_corrections || !matches!(i, PauliProductOperation::ConditionalRotation { .. })
         }));
     }
     circuit
+}
+
+fn resolve_corrections(circ: PauliProductCircuit) -> PauliProductCircuit {
+    use std::collections::HashMap;
+
+    let mut outcomes: HashMap<crate::pbc::MeasId, bool> = HashMap::new();
+    for instr in &circ.instructions {
+        if let PauliProductOperation::ConditionalRotation { condition: AllOf(ids), .. } = instr {
+            for &id in ids {
+                outcomes.entry(id).or_insert_with(rand::random);
+            }
+        }
+    }
+
+    let mut result = PauliProductCircuit::new();
+    result.next_meas_id = circ.next_meas_id;
+    for instr in circ.instructions {
+        match instr {
+            PauliProductOperation::ConditionalRotation { axis, angle, condition: AllOf(ref ids) } => {
+                if ids.iter().all(|id| *outcomes.get(id).unwrap_or(&false)) {
+                    result.instructions.push(PauliProductOperation::Rotation { axis, angle });
+                }
+            }
+            other => result.instructions.push(other),
+        }
+    }
+    result
 }
 
 fn to_load_store_circuit(subcircuits: Vec<Circuit>) -> LoadStoreCircuit {
@@ -760,24 +686,26 @@ fn to_load_store_circuit(subcircuits: Vec<Circuit>) -> LoadStoreCircuit {
 pub fn compile(
     circ: Circuit,
     max_subcircuit_size: usize,
-    emit_corrections: bool,
+    simulate_corrections: bool,
 ) -> PauliProductCircuit {
     let subcircuits = get_processor_subcircuits(circ, max_subcircuit_size);
     let load_store = to_load_store_circuit(subcircuits);
-    let pbc = to_pauli_product_circuit(load_store, emit_corrections);
-    absorb_into_measurement(pbc)
+    let pbc = to_pauli_product_circuit(load_store, simulate_corrections);
+    let resolved = if simulate_corrections { resolve_corrections(pbc) } else { pbc };
+    absorb_cliffords(resolved)
 }
 
 /// Returns (load_store, pbc_pre_clifford, pbc_final) for inspecting all intermediate stages.
 pub fn compile_steps(
     circ: Circuit,
     max_subcircuit_size: usize,
-    emit_corrections: bool,
+    simulate_corrections: bool,
 ) -> (LoadStoreCircuit, PauliProductCircuit, PauliProductCircuit) {
     let subcircuits = get_processor_subcircuits(circ, max_subcircuit_size);
     let load_store = to_load_store_circuit(subcircuits);
     let load_store_saved = load_store.clone();
-    let pbc = to_pauli_product_circuit(load_store, emit_corrections);
-    let clifford_free = absorb_into_measurement(pbc.clone());
+    let pbc = to_pauli_product_circuit(load_store, simulate_corrections);
+    let resolved = if simulate_corrections { resolve_corrections(pbc.clone()) } else { pbc.clone() };
+    let clifford_free = absorb_cliffords(resolved);
     (load_store_saved, pbc, clifford_free)
 }

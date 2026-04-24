@@ -21,71 +21,6 @@ impl AllOf {
     }
 }
 
-/// Pre-computed truth table of measurement axes indexed by measurement outcome patterns.
-///
-/// `conditions` lists all distinct MeasIds that influence this measurement.
-/// `axes[mask]` is the physical gadget (axis) to use when bit `i` of `mask` equals whether
-/// `conditions[i]` is 1.  An unconditional measurement has `conditions = []`, `axes = [base]`.
-#[derive(Clone, Debug)]
-pub struct ConditionedAxis {
-    pub conditions: Vec<MeasId>, // sorted; one per bit dimension of the truth table
-    pub axes: Vec<PauliAxis>,    // len == 1 << conditions.len()
-}
-
-impl ConditionedAxis {
-    pub fn unconditional(base: PauliAxis) -> Self {
-        Self {
-            conditions: vec![],
-            axes: vec![base],
-        }
-    }
-}
-
-/// Build the truth table for a measurement axis given a base and a list of conditional
-/// Clifford corrections.  Each correction `(AllOf(bits), factor)` is applied (multiplied
-/// into the axis) for every truth-table row where ALL bits in `bits` are set.
-pub fn build_conditioned_axis(base: PauliAxis, corrections: &[(AllOf, PauliAxis)]) -> ConditionedAxis {
-    if corrections.is_empty() {
-        return ConditionedAxis::unconditional(base);
-    }
-
-    // Collect all distinct MeasIds referenced across all conditions.
-    let mut all_ids: Vec<MeasId> = corrections
-        .iter()
-        .flat_map(|(allof, _)| allof.0.iter().copied())
-        .collect();
-    all_ids.sort_unstable();
-    all_ids.dedup();
-
-    let k = all_ids.len();
-    let n = 1usize << k;
-
-    // Initialize all rows with the base axis.
-    let mut axes: Vec<PauliAxis> = (0..n).map(|_| base.clone()).collect();
-
-    // For each row (bit assignment), apply corrections whose conditions are fully satisfied.
-    for mask in 0..n {
-        for (allof, factor) in corrections {
-            let all_set = allof.0.iter().all(|id| {
-                let bit = all_ids.binary_search(id).unwrap();
-                (mask >> bit) & 1 == 1
-            });
-            if all_set {
-                let ax = &axes[mask];
-                let product = pauli_string_mult(&factor.pauli_string, &ax.pauli_string);
-                axes[mask] = PauliAxis {
-                    sign: factor.sign * ax.sign * product.sign * Sign::J,
-                    pauli_string: product.pauli_string,
-                };
-            }
-        }
-    }
-
-    ConditionedAxis {
-        conditions: all_ids,
-        axes,
-    }
-}
 
 #[derive(Clone)]
 pub struct PauliProductCircuit {
@@ -256,7 +191,10 @@ pub enum PauliProductOperation {
     /// Classically-controlled Clifford correction: apply iff ALL bits in condition are 1.
     /// Only PiOver4 (Clifford) angles are meaningful here; PiOver2 corrections are software-only.
     ConditionalRotation { axis: PauliAxis, angle: PPRAngle, condition: AllOf },
-    Measurement { axis: ConditionedAxis, id: MeasId },
+    Measurement { axis: PauliAxis, id: MeasId },
+    /// Internal compiler marker: clear the Clifford frame for this qubit.
+    /// Emitted before Load operations; consumed by apply_clifford_frame, never in final output.
+    FrameReset(ArchitectureQubit),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -359,34 +297,6 @@ impl fmt::Display for AllOf {
     }
 }
 
-impl fmt::Display for ConditionedAxis {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.conditions.is_empty() {
-            // Unconditional: just show the axis.
-            write!(f, "{}", self.axes[0])
-        } else {
-            // Show the truth table: "base | mask→axis ..."
-            write!(f, "{}", self.axes[0])?;
-            let k = self.conditions.len();
-            for mask in 1..(1usize << k) {
-                // Describe which condition bits are set.
-                write!(f, " | ")?;
-                let mut first = true;
-                for i in 0..k {
-                    if (mask >> i) & 1 == 1 {
-                        if !first {
-                            write!(f, "∧")?;
-                        }
-                        write!(f, "{}", self.conditions[i])?;
-                        first = false;
-                    }
-                }
-                write!(f, "→{}", self.axes[mask])?;
-            }
-            Ok(())
-        }
-    }
-}
 
 impl fmt::Display for PauliProductOperation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -396,7 +306,116 @@ impl fmt::Display for PauliProductOperation {
                 write!(f, "R({angle}, {axis}) if {condition}")
             }
             PauliProductOperation::Measurement { axis, id } => write!(f, "[{id}] Meas({axis})"),
+            PauliProductOperation::FrameReset(q) => write!(f, "FrameReset({q})"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Clifford frame
+// ---------------------------------------------------------------------------
+
+/// Tracks where X[q] and Z[q] map to under accumulated unconditional Clifford corrections.
+/// Absent qubits are identity (X[q]→X[q], Z[q]→Z[q]).
+pub struct CliffordFrame {
+    x: std::collections::HashMap<ArchitectureQubit, PauliAxis>,
+    z: std::collections::HashMap<ArchitectureQubit, PauliAxis>,
+}
+
+impl CliffordFrame {
+    pub fn new() -> Self {
+        Self { x: std::collections::HashMap::new(), z: std::collections::HashMap::new() }
+    }
+
+    fn default_x(q: ArchitectureQubit) -> PauliAxis {
+        PauliAxis { sign: Sign::One, pauli_string: PauliString::new(vec![(q, Pauli::X)]) }
+    }
+
+    fn default_z(q: ArchitectureQubit) -> PauliAxis {
+        PauliAxis { sign: Sign::One, pauli_string: PauliString::new(vec![(q, Pauli::Z)]) }
+    }
+
+    /// Returns the image of basis element `p` on qubit `q` under the frame.
+    pub fn image(&self, q: ArchitectureQubit, p: Pauli) -> PauliAxis {
+        match p {
+            Pauli::X => self.x.get(&q).cloned().unwrap_or_else(|| Self::default_x(q)),
+            Pauli::Z => self.z.get(&q).cloned().unwrap_or_else(|| Self::default_z(q)),
+            Pauli::Y => {
+                // Y = iXZ  →  frame(Y[q]) = i · frame(X[q]) · frame(Z[q])
+                let xi = self.image(q, Pauli::X);
+                let zi = self.image(q, Pauli::Z);
+                let prod = pauli_string_mult(&xi.pauli_string, &zi.pauli_string);
+                PauliAxis {
+                    sign: xi.sign * zi.sign * prod.sign * Sign::J,
+                    pauli_string: prod.pauli_string,
+                }
+            }
+            Pauli::I => PauliAxis { sign: Sign::One, pauli_string: PauliString::new(vec![]) },
+        }
+    }
+
+    /// Conjugates `axis` by the frame: replaces each (q, p) factor with its frame image.
+    pub fn apply(&self, axis: &PauliAxis) -> PauliAxis {
+        let mut acc = PauliAxis { sign: axis.sign, pauli_string: PauliString::new(vec![]) };
+        for &(q, p) in axis.pauli_string.iter() {
+            let img = self.image(q, p);
+            let prod = pauli_string_mult(&acc.pauli_string, &img.pauli_string);
+            acc = PauliAxis { sign: acc.sign * img.sign * prod.sign, pauli_string: prod.pauli_string };
+        }
+        acc
+    }
+
+    /// Updates the frame by composing a PiOver4 rotation about `rotation` on the left.
+    /// Also initializes frame entries for qubits in `rotation` whose default basis
+    /// element anti-commutes with the rotation.
+    pub fn update(&mut self, rotation: &PauliAxis) {
+        let apply_rotation = |img: &PauliAxis, rot: &PauliAxis| -> Option<PauliAxis> {
+            if axes_commute(&rot.pauli_string, &img.pauli_string) {
+                None // no change
+            } else {
+                let prod = pauli_string_mult(&rot.pauli_string, &img.pauli_string);
+                Some(PauliAxis {
+                    sign: img.sign * rot.sign * prod.sign * Sign::J,
+                    pauli_string: prod.pauli_string,
+                })
+            }
+        };
+
+        // Update existing frame entries. Iterate maps directly to avoid
+        // a Vec allocation and the double-update bug that occurs when a
+        // qubit is present in both maps (chaining keys would visit it twice).
+        for xi in self.x.values_mut() {
+            if let Some(new_xi) = apply_rotation(xi, rotation) {
+                *xi = new_xi;
+            }
+        }
+        for zi in self.z.values_mut() {
+            if let Some(new_zi) = apply_rotation(zi, rotation) {
+                *zi = new_zi;
+            }
+        }
+
+        // Initialize entries for qubits in the rotation not yet in the frame.
+        for &(q, _) in rotation.pauli_string.iter() {
+            if !self.x.contains_key(&q) {
+                let default = Self::default_x(q);
+                if let Some(new_xi) = apply_rotation(&default, rotation) {
+                    self.x.insert(q, new_xi);
+                }
+            }
+            if !self.z.contains_key(&q) {
+                let default = Self::default_z(q);
+                if let Some(new_zi) = apply_rotation(&default, rotation) {
+                    self.z.insert(q, new_zi);
+                }
+            }
+        }
+    }
+
+    /// Clears the frame entries for `q` (called when `q` is loaded from memory).
+    pub fn reset(&mut self, q: ArchitectureQubit) {
+        self.x.remove(&q);
+        self.z.remove(&q);
     }
 }
 

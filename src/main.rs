@@ -36,9 +36,9 @@ struct Cli {
     #[arg(long, num_args = 0..=1, default_missing_value = "out")]
     intermediates: Option<PathBuf>,
 
-    /// Ignore Clifford corrections from T/Tdg/CCZ gates (reproduces pre-correction behavior)
+    /// Randomly resolve conditional rotations to unconditional ones before applying the Clifford frame
     #[arg(long)]
-    no_corrections: bool,
+    simulate_corrections: bool,
 }
 
 fn main() {
@@ -86,7 +86,7 @@ fn main() {
             eprintln!("error creating intermediates dir: {e}");
             process::exit(1);
         });
-        let (load_store, pbc_pre, pbc_final) = compile_steps(circuit, proc_cap, !cli.no_corrections);
+        let (load_store, pbc_pre, pbc_final) = compile_steps(circuit, proc_cap, cli.simulate_corrections);
         let writes = [
             ("load_store.txt", load_store.to_string()),
             ("pbc_w_clifford.txt", pbc_pre.to_string()),
@@ -99,6 +99,6 @@ fn main() {
             });
         }
     } else {
-        println!("{}", compile(circuit, proc_cap, !cli.no_corrections));
+        println!("{}", compile(circuit, proc_cap, cli.simulate_corrections));
     }
 }
