@@ -317,6 +317,7 @@ impl fmt::Display for PauliProductOperation {
 
 /// Tracks where X[q] and Z[q] map to under accumulated unconditional Clifford corrections.
 /// Absent qubits are identity (X[q]→X[q], Z[q]→Z[q]).
+#[derive(Debug)]
 pub struct CliffordFrame {
     x: std::collections::HashMap<ArchitectureQubit, PauliAxis>,
     z: std::collections::HashMap<ArchitectureQubit, PauliAxis>,
@@ -365,52 +366,45 @@ impl CliffordFrame {
         acc
     }
 
+
+
     /// Updates the frame by composing a PiOver4 rotation about `rotation` on the left.
     /// Also initializes frame entries for qubits in `rotation` whose default basis
     /// element anti-commutes with the rotation.
     pub fn update(&mut self, rotation: &PauliAxis) {
-        let apply_rotation = |img: &PauliAxis, rot: &PauliAxis| -> Option<PauliAxis> {
-            if axes_commute(&rot.pauli_string, &img.pauli_string) {
-                None // no change
-            } else {
-                let prod = pauli_string_mult(&rot.pauli_string, &img.pauli_string);
-                Some(PauliAxis {
-                    sign: img.sign * rot.sign * prod.sign * Sign::J,
-                    pauli_string: prod.pauli_string,
-                })
-            }
-        };
+        let rot_qubits = rotation.pauli_string.iter().map(|&(q, _)| q);
 
-        // Update existing frame entries. Iterate maps directly to avoid
-        // a Vec allocation and the double-update bug that occurs when a
-        // qubit is present in both maps (chaining keys would visit it twice).
-        for xi in self.x.values_mut() {
-            if let Some(new_xi) = apply_rotation(xi, rotation) {
-                *xi = new_xi;
+        let x_qubits: Vec<_> = self.x.keys().cloned().chain(rot_qubits.clone())
+            .collect::<std::collections::HashSet<_>>().into_iter().collect();
+        for q in x_qubits {
+            let row = PauliAxis{sign : Sign::One, pauli_string : PauliString::new(vec![(q, Pauli::X)])};
+            if !axes_commute(&row.pauli_string, &rotation.pauli_string){
+ 
+                let prod = pauli_string_mult(&rotation.pauli_string, &row.pauli_string);
+                let sign = Sign::J * prod.sign * row.sign * rotation.sign;
+                let new_axis: PauliAxis = self.apply(&PauliAxis {sign, pauli_string : prod.pauli_string });
+                self.x.insert(q, new_axis);
+
+
             }
         }
-        for zi in self.z.values_mut() {
-            if let Some(new_zi) = apply_rotation(zi, rotation) {
-                *zi = new_zi;
-            }
-        }
+        let z_qubits: Vec<_> = self.z.keys().cloned().chain(rot_qubits)
+            .collect::<std::collections::HashSet<_>>().into_iter().collect();
+        for q in z_qubits {
+            let row = PauliAxis{sign : Sign::One, pauli_string : PauliString::new(vec![(q, Pauli::Z)])};
+            if !axes_commute(&row.pauli_string, &rotation.pauli_string){
+ 
+                let prod = pauli_string_mult(&rotation.pauli_string, &row.pauli_string);
+                let sign = Sign::J * prod.sign * row.sign * rotation.sign;
+                let new_axis = self.apply(&PauliAxis { sign, pauli_string : prod.pauli_string });
+                self.z.insert(q, new_axis);
 
-        // Initialize entries for qubits in the rotation not yet in the frame.
-        for &(q, _) in rotation.pauli_string.iter() {
-            if !self.x.contains_key(&q) {
-                let default = Self::default_x(q);
-                if let Some(new_xi) = apply_rotation(&default, rotation) {
-                    self.x.insert(q, new_xi);
-                }
-            }
-            if !self.z.contains_key(&q) {
-                let default = Self::default_z(q);
-                if let Some(new_zi) = apply_rotation(&default, rotation) {
-                    self.z.insert(q, new_zi);
-                }
+
             }
         }
     }
+
+    
 
     /// Clears the frame entries for `q` (called when `q` is loaded from memory).
     pub fn reset(&mut self, q: ArchitectureQubit) {
@@ -418,6 +412,7 @@ impl CliffordFrame {
         self.z.remove(&q);
     }
 }
+
 
 impl fmt::Display for PauliProductCircuit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

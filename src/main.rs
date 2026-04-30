@@ -39,6 +39,10 @@ struct Cli {
     /// Randomly resolve conditional rotations to unconditional ones before applying the Clifford frame
     #[arg(long)]
     simulate_corrections: bool,
+
+    /// Skip redundant load/store pairs when a qubit appears in consecutive subcircuits
+    #[arg(long)]
+    skip_redundant_ls: bool,
 }
 
 fn main() {
@@ -86,7 +90,7 @@ fn main() {
             eprintln!("error creating intermediates dir: {e}");
             process::exit(1);
         });
-        let (load_store, pbc_pre, pbc_final) = compile_steps(circuit, proc_cap, cli.simulate_corrections);
+        let (load_store, pbc_pre, pbc_final) = compile_steps(circuit, proc_cap, cli.simulate_corrections, cli.skip_redundant_ls);
         let writes = [
             ("load_store.txt", load_store.to_string()),
             ("pbc_w_clifford.txt", pbc_pre.to_string()),
@@ -98,7 +102,8 @@ fn main() {
                 process::exit(1);
             });
         }
+        println!("Results written to {}/ directory. Final instruction count: {}", dir.to_str().unwrap(), pbc_final.instructions.len())
     } else {
-        println!("{}", compile(circuit, proc_cap, cli.simulate_corrections));
+        println!("{}", compile(circuit, proc_cap, cli.simulate_corrections, cli.skip_redundant_ls));
     }
 }

@@ -564,10 +564,10 @@ fn absorb_cliffords(circ: PauliProductCircuit) -> PauliProductCircuit {
     result.next_meas_id = circ.next_meas_id;
     let mut frame = CliffordFrame::new();
 
-    for instr in circ.instructions {
+    for ref instr in circ.instructions {
         match instr {
             PauliProductOperation::FrameReset(q) => {
-                frame.reset(q);
+                frame.reset(*q);
             }
             PauliProductOperation::Rotation {
                 axis,
@@ -600,7 +600,7 @@ fn absorb_cliffords(circ: PauliProductCircuit) -> PauliProductCircuit {
                     .instructions
                     .push(PauliProductOperation::Measurement {
                         axis: effective,
-                        id,
+                        id : *id,
                     });
             }
         }
@@ -650,35 +650,67 @@ fn resolve_corrections(circ: PauliProductCircuit) -> PauliProductCircuit {
     result
 }
 
-fn to_load_store_circuit(subcircuits: Vec<Circuit>) -> LoadStoreCircuit {
+fn to_load_store_circuit(
+    subcircuits: Vec<Circuit>,
+    max_subcircuit_size: usize,
+    skip_redundant: bool,
+) -> LoadStoreCircuit {
     let mut ops = Vec::new();
+    // Tracks which memory qubits are currently on the processor and their assigned slot.
+    // When skip_redundant is false this is always empty at the start of each subcircuit.
+    let mut in_flight: HashMap<Qubit, ArchitectureQubit> = HashMap::new();
+
     for sub in subcircuits {
-        let mut circuit_to_processor_qubit: HashMap<Qubit, ArchitectureQubit> = HashMap::new();
-        let mut loaded_count = 0;
-        let mut sorted_qubits: Vec<_> = sub.qubits.iter().collect();
-        sorted_qubits.sort_unstable_by_key(|q| q.0);
-        for q in sorted_qubits {
-            ops.push(LoadStoreOp::Load(
-                ArchitectureQubit::Memory(q.0),
-                ArchitectureQubit::Processor(loaded_count),
-            ));
-            circuit_to_processor_qubit.insert(*q, ArchitectureQubit::Processor(loaded_count));
-            loaded_count += 1;
+        if skip_redundant {
+            // Only evict enough qubits to free slots for the ones we need to load.
+            let new_count = sub.qubits.iter().filter(|q| !in_flight.contains_key(q)).count();
+            let must_evict = in_flight.len().saturating_sub(max_subcircuit_size - new_count);
+            let mut evictable: Vec<Qubit> = in_flight.keys()
+                .filter(|q| !sub.qubits.contains(q))
+                .cloned()
+                .collect();
+            evictable.sort_unstable_by_key(|q| q.0);
+            for q in evictable.into_iter().take(must_evict) {
+                let proc = in_flight.remove(&q).unwrap();
+                ops.push(LoadStoreOp::Store(proc, ArchitectureQubit::Memory(q.0)));
+            }
+
+            // Carried qubits hold specific processor slots; new qubits fill the gaps.
+            let used_slots: HashSet<usize> = in_flight.values()
+                .filter_map(|aq| if let ArchitectureQubit::Processor(s) = aq { Some(*s) } else { None })
+                .collect();
+            let mut free_slots = (0usize..).filter(|s| !used_slots.contains(s));
+            let mut to_load: Vec<_> = sub.qubits.iter()
+                .filter(|q| !in_flight.contains_key(q))
+                .collect();
+            to_load.sort_unstable_by_key(|q| q.0);
+            for q in to_load {
+                let proc = ArchitectureQubit::Processor(free_slots.next().unwrap());
+                ops.push(LoadStoreOp::Load(ArchitectureQubit::Memory(q.0), proc));
+                in_flight.insert(*q, proc);
+            }
+        } else {
+            let mut sorted_qubits: Vec<_> = sub.qubits.iter().collect();
+            sorted_qubits.sort_unstable_by_key(|q| q.0);
+            for (slot, q) in sorted_qubits.into_iter().enumerate() {
+                let proc = ArchitectureQubit::Processor(slot);
+                ops.push(LoadStoreOp::Load(ArchitectureQubit::Memory(q.0), proc));
+                in_flight.insert(*q, proc);
+            }
         }
-        for gate in sub.gates {
-            ops.push(LoadStoreOp::Gate(shift_register_hashmap(
-                &gate,
-                &circuit_to_processor_qubit,
-            )));
+
+        for gate in &sub.gates {
+            ops.push(LoadStoreOp::Gate(shift_register_hashmap(gate, &in_flight)));
         }
-        let mut sorted_stores: Vec<_> = circuit_to_processor_qubit.iter().collect();
-        sorted_stores.sort_unstable_by_key(|(q, _)| q.0);
-        for (circ_qubit, proc_qubit) in sorted_stores {
-            ops.push(LoadStoreOp::Store(
-                *proc_qubit,
-                ArchitectureQubit::Memory(circ_qubit.0),
-            ));
+
+        if !skip_redundant {
+            let mut sorted: Vec<_> = in_flight.drain().collect();
+            sorted.sort_unstable_by_key(|(q, _)| q.0);
+            for (q, proc) in sorted {
+                ops.push(LoadStoreOp::Store(proc, ArchitectureQubit::Memory(q.0)));
+            }
         }
+        // skip_redundant: leave in_flight populated so qubits stay on the processor.
     }
     LoadStoreCircuit { ops }
 }
@@ -687,9 +719,10 @@ pub fn compile(
     circ: Circuit,
     max_subcircuit_size: usize,
     simulate_corrections: bool,
+    skip_redundant: bool,
 ) -> PauliProductCircuit {
     let subcircuits = get_processor_subcircuits(circ, max_subcircuit_size);
-    let load_store = to_load_store_circuit(subcircuits);
+    let load_store = to_load_store_circuit(subcircuits, max_subcircuit_size, skip_redundant);
     let pbc = to_pauli_product_circuit(load_store, simulate_corrections);
     let resolved = if simulate_corrections { resolve_corrections(pbc) } else { pbc };
     absorb_cliffords(resolved)
@@ -700,12 +733,73 @@ pub fn compile_steps(
     circ: Circuit,
     max_subcircuit_size: usize,
     simulate_corrections: bool,
+    skip_redundant: bool,
 ) -> (LoadStoreCircuit, PauliProductCircuit, PauliProductCircuit) {
     let subcircuits = get_processor_subcircuits(circ, max_subcircuit_size);
-    let load_store = to_load_store_circuit(subcircuits);
+    let load_store = to_load_store_circuit(subcircuits, max_subcircuit_size, skip_redundant);
     let load_store_saved = load_store.clone();
     let pbc = to_pauli_product_circuit(load_store, simulate_corrections);
     let resolved = if simulate_corrections { resolve_corrections(pbc.clone()) } else { pbc.clone() };
     let clifford_free = absorb_cliffords(resolved);
     (load_store_saved, pbc, clifford_free)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pbc::{MeasId, PPRAngle, Pauli, PauliAxis, PauliProductCircuit, PauliProductOperation, PauliString};
+    use crate::pbc::Sign::{self, One};
+    use ArchitectureQubit::Processor;
+
+    fn single(sign: Sign, q: ArchitectureQubit, p: Pauli) -> PauliAxis {
+        PauliAxis { sign, pauli_string: PauliString::new(vec![(q, p)]) }
+    }
+
+    fn rot(axis: PauliAxis, angle: PPRAngle) -> PauliProductOperation {
+        PauliProductOperation::Rotation { axis, angle }
+    }
+
+    fn meas(axis: PauliAxis, id: u32) -> PauliProductOperation {
+        PauliProductOperation::Measurement { axis, id: MeasId(id) }
+    }
+
+    fn absorbed_meas(instrs: Vec<PauliProductOperation>) -> PauliAxis {
+        let mut circ = PauliProductCircuit::new();
+        circ.instructions = instrs;
+        let out = absorb_cliffords(circ);
+        assert_eq!(out.instructions.len(), 1, "expected exactly one output instruction");
+        match out.instructions.into_iter().next().unwrap() {
+            PauliProductOperation::Measurement { axis, .. } => axis,
+            other => panic!("expected Measurement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn x_pi4_z_pi4_then_z_meas() {
+        let q = Processor(0);
+        let result = absorbed_meas(vec![
+            rot(single(One, q, Pauli::X), PPRAngle::PiOver4),
+            rot(single(One, q, Pauli::Z), PPRAngle::PiOver4),
+            meas(single(One, q, Pauli::Z), 0),
+        ]);
+
+        let expected_sign =   One;
+        let expected_pauli = Pauli::Y;
+        assert_eq!(result.sign, expected_sign);
+        assert_eq!(&*result.pauli_string, &[(q, expected_pauli)]);
+    }
+    #[test]
+        fn z_pi4_x_pi4_then_z_meas() {
+        let q = Processor(0);
+        let result = absorbed_meas(vec![
+            rot(single(One, q, Pauli::Z), PPRAngle::PiOver4),
+            rot(single(One, q, Pauli::X), PPRAngle::PiOver4),
+            meas(single(One, q, Pauli::Z), 0),
+        ]);
+
+        let expected_sign = One;
+        let expected_pauli = Pauli::X;
+        assert_eq!(result.sign, expected_sign);
+        assert_eq!(&*result.pauli_string, &[(q, expected_pauli)]);
+    }
 }
