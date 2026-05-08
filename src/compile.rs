@@ -5,6 +5,7 @@ use crate::pbc::{
     Pauli, PauliAxis, PauliProductCircuit, PauliProductOperation, PauliString,
     Sign::{NegOne, One},
 };
+
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -660,19 +661,32 @@ fn to_load_store_circuit(
     // When skip_redundant is false this is always empty at the start of each subcircuit.
     let mut in_flight: HashMap<Qubit, ArchitectureQubit> = HashMap::new();
 
-    for sub in subcircuits {
+    // Belady's (OPT) eviction: pre-compute the sorted list of subcircuit indices at which
+    // each qubit is needed. At eviction time we look up the first index > i to find each
+    // candidate's next use; we evict the one whose next use is furthest away (or never).
+    let next_use: HashMap<Qubit, Vec<usize>> = if skip_redundant {
+        let mut map: HashMap<Qubit, Vec<usize>> = HashMap::new();
+        for (i, sub) in subcircuits.iter().enumerate() {
+            for &q in &sub.qubits {
+                map.entry(q).or_default().push(i);
+            }
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
+    for (i, sub) in subcircuits.into_iter().enumerate() {
         if skip_redundant {
             // Only evict enough qubits to free slots for the ones we need to load.
             let new_count = sub.qubits.iter().filter(|q| !in_flight.contains_key(q)).count();
             let must_evict = in_flight.len().saturating_sub(max_subcircuit_size - new_count);
-            let mut evictable: Vec<Qubit> = in_flight.keys()
-                .filter(|q| !sub.qubits.contains(q))
-                .cloned()
-                .collect();
-            evictable.sort_unstable_by_key(|q| q.0);
-            for q in evictable.into_iter().take(must_evict) {
-                let proc = in_flight.remove(&q).unwrap();
-                ops.push(LoadStoreOp::Store(proc, ArchitectureQubit::Memory(q.0)));
+            if must_evict > 0 {
+                let eviction_candidates = rank_evictable_qubits(&in_flight, &next_use, i, &sub);
+                for q in eviction_candidates.into_iter().take(must_evict) {
+                    let proc = in_flight.remove(&q).unwrap();
+                    ops.push(LoadStoreOp::Store(proc, ArchitectureQubit::Memory(q.0)));
+                }
             }
 
             // Carried qubits hold specific processor slots; new qubits fill the gaps.
@@ -715,14 +729,65 @@ fn to_load_store_circuit(
     LoadStoreCircuit { ops }
 }
 
+fn rank_evictable_qubits(in_flight: &HashMap<Qubit, ArchitectureQubit>, next_use: &HashMap<Qubit, Vec<usize>>, i: usize, sub: &Circuit) -> Vec<Qubit> {
+    // next_use_after(q): the first subcircuit index strictly after i where q appears,
+    // or usize::MAX if q is never used again.
+    let next_use_after = |q: &Qubit| -> usize {
+        next_use.get(q)
+            .and_then(|uses| {
+                let pos = uses.partition_point(|&u| u <= i);
+                uses.get(pos).copied()
+            })
+            .unwrap_or(usize::MAX)
+    };
+    let mut evictable: Vec<Qubit> = in_flight.keys()
+        .filter(|q| !sub.qubits.contains(q))
+        .cloned()
+        .collect();
+    // Sort descending by next future use so we evict furthest-future first.
+    // Break ties by qubit index for determinism.
+    evictable.sort_unstable_by(|a, b| {
+        next_use_after(b).cmp(&next_use_after(a)).then(b.0.cmp(&a.0))
+    });
+    evictable
+}
+
+fn partition(
+    circ: &Circuit,
+    max_subcircuit_size: usize,
+    skip_redundant: bool,
+    sat_mode: bool,
+    sat_timeout: Option<u64>,
+) -> (Vec<Circuit>, bool) {
+    if !sat_mode {
+        return (get_processor_subcircuits(circ.clone(), max_subcircuit_size), skip_redundant);
+    }
+    // Run greedy first to learn max_k and a tight initial upper bound on load/stores.
+    // The greedy Belady count avoids wasting the first SAT call on an unconstrained solve.
+    let greedy = get_processor_subcircuits(circ.clone(), max_subcircuit_size);
+    let max_k = (greedy.len() * 3/3).min(circ.gates.len().max(1));
+    let greedy_ls = to_load_store_circuit(greedy, max_subcircuit_size, true);
+    let initial_best_k = greedy_ls.ops.iter()
+        .filter(|op| matches!(op, LoadStoreOp::Load(..) | LoadStoreOp::Store(..)))
+        .count();
+    // SAT mode forces skip_redundant=true (required for Belady's optimality guarantee).
+    // Fall back to greedy if the solver finds no feasible assignment (e.g. capacity too tight).
+    match crate::sat_partition::slice_and_optimize(circ, max_subcircuit_size, max_k, 5,  Some(initial_best_k), sat_timeout) {
+        Some(subcircuits) =>  (subcircuits, true),
+        None => {eprintln!("SAT solving failed, falling back on greedy solution..."); (get_processor_subcircuits(circ.clone(), max_subcircuit_size), true)},
+    }
+}
+
 pub fn compile(
     circ: Circuit,
     max_subcircuit_size: usize,
     simulate_corrections: bool,
     skip_redundant: bool,
+    sat_mode: bool,
+    sat_timeout: Option<u64>,
 ) -> PauliProductCircuit {
-    let subcircuits = get_processor_subcircuits(circ, max_subcircuit_size);
-    let load_store = to_load_store_circuit(subcircuits, max_subcircuit_size, skip_redundant);
+    let (subcircuits, effective_skip) = partition(&circ, max_subcircuit_size, skip_redundant, sat_mode, sat_timeout);
+    let load_store = to_load_store_circuit(subcircuits, max_subcircuit_size, effective_skip);
     let pbc = to_pauli_product_circuit(load_store, simulate_corrections);
     let resolved = if simulate_corrections { resolve_corrections(pbc) } else { pbc };
     absorb_cliffords(resolved)
@@ -734,10 +799,20 @@ pub fn compile_steps(
     max_subcircuit_size: usize,
     simulate_corrections: bool,
     skip_redundant: bool,
+    sat_mode: bool,
+    sat_timeout: Option<u64>,
 ) -> (LoadStoreCircuit, PauliProductCircuit, PauliProductCircuit) {
-    let subcircuits = get_processor_subcircuits(circ, max_subcircuit_size);
-    let load_store = to_load_store_circuit(subcircuits, max_subcircuit_size, skip_redundant);
+    let (subcircuits, effective_skip) = partition(&circ, max_subcircuit_size, skip_redundant, sat_mode, sat_timeout);
+    println!("Subcircuit count: {}", subcircuits.len());
+    let load_store = to_load_store_circuit(subcircuits, max_subcircuit_size, effective_skip);
     let load_store_saved = load_store.clone();
+    let load_store_count = load_store_saved.ops.iter().fold(0, |acc, x| match x  {
+        LoadStoreOp::Load(_, _) => acc+1,
+        LoadStoreOp::Store(_, _) => acc+1,
+        LoadStoreOp::Gate(_) => acc,
+    } );
+    println!("Load store count: {load_store_count}"
+    );
     let pbc = to_pauli_product_circuit(load_store, simulate_corrections);
     let resolved = if simulate_corrections { resolve_corrections(pbc.clone()) } else { pbc.clone() };
     let clifford_free = absorb_cliffords(resolved);
@@ -747,9 +822,117 @@ pub fn compile_steps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::circuit::{Circuit, Gate, Qubit};
     use crate::pbc::{MeasId, PPRAngle, Pauli, PauliAxis, PauliProductCircuit, PauliProductOperation, PauliString};
     use crate::pbc::Sign::{self, One};
+    use crate::sat_partition::optimize_partition;
     use ArchitectureQubit::Processor;
+
+    fn make_circuit(num_qubits: usize, gates: Vec<Gate<Qubit>>) -> Circuit {
+        let mut c = Circuit::new(num_qubits);
+        for g in gates {
+            c.apply(g);
+        }
+        c
+    }
+
+    fn count_ls(ls: &LoadStoreCircuit) -> usize {
+        ls.ops.iter().filter(|op| matches!(op, LoadStoreOp::Load(..) | LoadStoreOp::Store(..))).count()
+    }
+
+    // --- greedy partitioner tests ---
+
+    #[test]
+    fn test_greedy_capacity_respected() {
+        // 3 independent H gates; proc_cap=2 forces at least 2 subcircuits
+        let circ = make_circuit(3, vec![Gate::H(Qubit(0)), Gate::H(Qubit(1)), Gate::H(Qubit(2))]);
+        let subs = get_processor_subcircuits(circ, 2);
+        assert!(subs.len() >= 2, "expected at least 2 subcircuits");
+        for sub in &subs {
+            assert!(sub.qubits.len() <= 2, "subcircuit exceeds proc_cap=2");
+        }
+    }
+
+    #[test]
+    fn test_greedy_preserves_all_gates() {
+        let circ = make_circuit(3, vec![Gate::H(Qubit(0)), Gate::H(Qubit(1)), Gate::H(Qubit(2))]);
+        let subs = get_processor_subcircuits(circ, 2);
+        let total_gates: usize = subs.iter().map(|s| s.gates.len()).sum();
+        assert_eq!(total_gates, 3);
+    }
+
+    // --- to_load_store_circuit tests ---
+
+    #[test]
+    fn test_ls_no_skip_all_loads_stores() {
+        // sub0={q0,q1}, sub1={q0}: without skip every boundary is full load+store
+        let sub0 = make_circuit(2, vec![Gate::H(Qubit(0)), Gate::H(Qubit(1))]);
+        let sub1 = make_circuit(2, vec![Gate::H(Qubit(0))]);
+        let ls = to_load_store_circuit(vec![sub0, sub1], 2, false);
+        // sub0: 2 loads + 2 stores; sub1: 1 load + 1 store
+        assert_eq!(count_ls(&ls), 6);
+    }
+
+    #[test]
+    fn test_ls_skip_keeps_shared_qubits_in_flight() {
+        // sub0={q0,q1}, sub1={q0,q2}, proc_cap=2
+        // q0 stays; q1 is evicted (not needed in sub1); q2 is loaded → 3 loads + 1 store
+        let sub0 = make_circuit(3, vec![Gate::H(Qubit(0)), Gate::H(Qubit(1))]);
+        let sub1 = make_circuit(3, vec![Gate::H(Qubit(0)), Gate::H(Qubit(2))]);
+        let ls = to_load_store_circuit(vec![sub0, sub1], 2, true);
+        assert_eq!(count_ls(&ls), 4);
+    }
+
+    #[test]
+    fn test_ls_belady_evicts_furthest_future_qubit() {
+        // sub0={q0,q1}, sub1={q2}, sub2={q0,q2}, proc_cap=2
+        // At sub1: Belady evicts q1 (next use = never) over q0 (next use = sub2).
+        // So q0 stays in flight into sub2, avoiding a reload → 3 loads + 1 store = 4 ops.
+        // A naive eviction (remove q0) would require an extra load+store → 5+ ops.
+        let sub0 = make_circuit(3, vec![Gate::H(Qubit(0)), Gate::H(Qubit(1))]);
+        let sub1 = make_circuit(3, vec![Gate::H(Qubit(2))]);
+        let sub2 = make_circuit(3, vec![Gate::H(Qubit(0)), Gate::H(Qubit(2))]);
+        let ls = to_load_store_circuit(vec![sub0, sub1, sub2], 2, true);
+        assert_eq!(count_ls(&ls), 4);
+    }
+
+    // --- SAT partitioner tests ---
+
+    fn four_qubit_circuit() -> Circuit {
+        // H(q0), H(q1), H(q2), H(q3), CNOT(q0,q2), CNOT(q1,q3)
+        // DAG: H(qi) -> CNOT that uses qi
+        // Greedy with proc_cap=2 yields 4 subcircuits, 12 load/store ops (with Belady skip).
+        // SAT optimum rearranges into {q0,q2} / {q0,q2} / {q1,q3} / {q1,q3}, giving 6 ops.
+        make_circuit(4, vec![
+            Gate::H(Qubit(0)),
+            Gate::H(Qubit(1)),
+            Gate::H(Qubit(2)),
+            Gate::H(Qubit(3)),
+            Gate::CNOT { control: Qubit(0), target: Qubit(2) },
+            Gate::CNOT { control: Qubit(1), target: Qubit(3) },
+        ])
+    }
+
+    #[test]
+    fn test_sat_respects_capacity() {
+        let circ = four_qubit_circuit();
+        let subs = optimize_partition(&circ, 2, 8, Some(12), None, &HashMap::new()).unwrap().0;
+        for sub in &subs {
+            assert!(sub.qubits.len() <= 2, "SAT subcircuit exceeds proc_cap=2");
+        }
+    }
+
+    #[test]
+    fn test_sat_finds_better_partition() {
+        let circ = four_qubit_circuit();
+        let greedy_subs = get_processor_subcircuits(circ.clone(), 2);
+        let max_k = greedy_subs.len() * 2;
+        let greedy_count = count_ls(&to_load_store_circuit(greedy_subs, 2, true));
+        let sat_subs = optimize_partition(&circ, 2, max_k, Some(greedy_count), None, &HashMap::new()).unwrap().0;
+        let sat_count = count_ls(&to_load_store_circuit(sat_subs, 2, true));
+        assert!(sat_count < greedy_count, "SAT ({sat_count}) should beat greedy ({greedy_count})");
+        assert_eq!(sat_count, 6, "expected optimal 4 loads + 2 stores = 6");
+    }
 
     fn single(sign: Sign, q: ArchitectureQubit, p: Pauli) -> PauliAxis {
         PauliAxis { sign, pauli_string: PauliString::new(vec![(q, p)]) }

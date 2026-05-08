@@ -5,4 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+highs = "2.1.0"
 rand = "0.8"
+rustsat = "0.7.5"
+rustsat-cadical = "0.7.5"

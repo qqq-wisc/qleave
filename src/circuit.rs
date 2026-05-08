@@ -4,7 +4,7 @@ use std::{
     hash::Hash,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Circuit {
     pub gates: Vec<Gate<Qubit>>,
     pub qubits: HashSet<Qubit>,

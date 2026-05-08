@@ -43,6 +43,15 @@ struct Cli {
     /// Skip redundant load/store pairs when a qubit appears in consecutive subcircuits
     #[arg(long)]
     skip_redundant_ls: bool,
+
+    /// Use SAT-based optimal partitioner (max_k and initial bound learned from greedy).
+    /// Implies --skip-redundant-ls (required for Belady's optimality guarantee).
+    #[arg(long)]
+    sat: bool,
+
+    /// Timeout in seconds for the SAT optimizer (returns best solution found so far)
+    #[arg(long, requires = "sat")]
+    sat_timeout: Option<u64>,
 }
 
 fn main() {
@@ -90,7 +99,14 @@ fn main() {
             eprintln!("error creating intermediates dir: {e}");
             process::exit(1);
         });
-        let (load_store, pbc_pre, pbc_final) = compile_steps(circuit, proc_cap, cli.simulate_corrections, cli.skip_redundant_ls);
+        let (load_store, pbc_pre, pbc_final) = compile_steps(
+            circuit,
+            proc_cap,
+            cli.simulate_corrections,
+            cli.skip_redundant_ls,
+            cli.sat,
+            cli.sat_timeout,
+        );
         let writes = [
             ("load_store.txt", load_store.to_string()),
             ("pbc_w_clifford.txt", pbc_pre.to_string()),
@@ -102,8 +118,22 @@ fn main() {
                 process::exit(1);
             });
         }
-        println!("Results written to {}/ directory. Final instruction count: {}", dir.to_str().unwrap(), pbc_final.instructions.len())
+        println!("Final instruction count: {}", pbc_final.instructions.len());
+        println!(
+            "Results written to {}/ directory.",
+            dir.to_str().unwrap(),
+        )
     } else {
-        println!("{}", compile(circuit, proc_cap, cli.simulate_corrections, cli.skip_redundant_ls));
+        println!(
+            "{}",
+            compile(
+                circuit,
+                proc_cap,
+                cli.simulate_corrections,
+                cli.skip_redundant_ls,
+                cli.sat,
+                cli.sat_timeout,
+            )
+        );
     }
 }
