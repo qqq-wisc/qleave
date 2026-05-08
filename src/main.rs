@@ -103,7 +103,7 @@ fn main() {
             circuit,
             proc_cap,
             cli.simulate_corrections,
-            cli.skip_redundant_ls,
+            cli.skip_redundant_ls || cli.sat, // If using SAT, we must skip redundant load/stores to guarantee optimality (Belady's algorithm)
             cli.sat,
             cli.sat_timeout,
         );
@@ -130,7 +130,7 @@ fn main() {
                 circuit,
                 proc_cap,
                 cli.simulate_corrections,
-                cli.skip_redundant_ls,
+                cli.skip_redundant_ls || cli.sat, // If using SAT, we must skip redundant load/stores to guarantee optimality (Belady's algorithm)
                 cli.sat,
                 cli.sat_timeout,
             )

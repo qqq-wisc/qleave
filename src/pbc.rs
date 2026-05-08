@@ -119,7 +119,7 @@ pub fn pauli_string_mult(a: &PauliString, b: &PauliString) -> PauliAxis {
                 let &(q, p) = bi.next().unwrap();
                 out.push((q, p));
             }
-            (Some(&(qa, _)), Some(&(qb, _))) => match qa.cmp(&qb) {
+            (Some(&(qa, _)), Some(&(qb, _))) => match qa.cmp(qb) {
                 std::cmp::Ordering::Less => {
                     let &(q, p) = ai.next().unwrap();
                     out.push((q, p));
@@ -154,7 +154,7 @@ pub fn axes_commute(a: &PauliString, b: &PauliString) -> bool {
     loop {
         match (ai.peek(), bi.peek()) {
             (None, _) | (_, None) => break,
-            (Some(&(qa, _)), Some(&(qb, _))) => match qa.cmp(&qb) {
+            (Some(&(qa, _)), Some(&(qb, _))) => match qa.cmp(qb) {
                 std::cmp::Ordering::Less => {
                     ai.next();
                 }
@@ -178,7 +178,7 @@ pub fn axes_commute(a: &PauliString, b: &PauliString) -> bool {
             },
         }
     }
-    anti % 2 == 0
+    anti.is_multiple_of(2)
 }
 #[derive(Clone, Debug)]
 pub struct PauliAxis {

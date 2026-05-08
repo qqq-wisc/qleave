@@ -289,7 +289,7 @@ fn gate_to_pbc_instructions(
                 angle: PiOver4,
             },
         ],
-        // See fig 14 in active volume paper
+        // See fig 14 in active volume paper https://arxiv.org/pdf/2211.15465
         Gate::CCZ {
             control1,
             control2,
@@ -475,7 +475,7 @@ fn gate_to_pbc_instructions(
     }
 }
 
-fn ls_circuit_op_to_pbc_op(op: LoadStoreOp, next_id: &mut u32) -> Vec<PauliProductOperation> {
+fn ls_circuit_op_to_pbc_op(op: &LoadStoreOp, next_id: &mut u32) -> Vec<PauliProductOperation> {
     let mut alloc = || {
         let id = MeasId(*next_id);
         *next_id += 1;
@@ -487,18 +487,18 @@ fn ls_circuit_op_to_pbc_op(op: LoadStoreOp, next_id: &mut u32) -> Vec<PauliProdu
             let m0 = alloc();
             let m1 = alloc();
             vec![
-                PauliProductOperation::FrameReset(proc),
+                PauliProductOperation::FrameReset(*proc),
                 PauliProductOperation::Measurement {
                     axis: PauliAxis {
                         sign: One,
-                        pauli_string: PauliString::new(vec![(mem, Pauli::Z), (proc, Pauli::Z)]),
+                        pauli_string: PauliString::new(vec![(*mem, Pauli::Z), (*proc, Pauli::Z)]),
                     },
                     id: m0,
                 },
                 PauliProductOperation::ConditionalRotation {
                     axis: PauliAxis {
                         sign: One,
-                        pauli_string: PauliString::new(vec![(proc, Pauli::X)]),
+                        pauli_string: PauliString::new(vec![(*proc, Pauli::X)]),
                     },
                     angle: PiOver2,
                     condition: AllOf(vec![m0]),
@@ -506,14 +506,14 @@ fn ls_circuit_op_to_pbc_op(op: LoadStoreOp, next_id: &mut u32) -> Vec<PauliProdu
                 PauliProductOperation::Measurement {
                     axis: PauliAxis {
                         sign: One,
-                        pauli_string: PauliString::new(vec![(mem, Pauli::X)]),
+                        pauli_string: PauliString::new(vec![(*mem, Pauli::X)]),
                     },
                     id: m1,
                 },
                 PauliProductOperation::ConditionalRotation {
                     axis: PauliAxis {
                         sign: One,
-                        pauli_string: PauliString::new(vec![(proc, Pauli::Z)]),
+                        pauli_string: PauliString::new(vec![(*proc, Pauli::Z)]),
                     },
                     angle: PiOver2,
                     condition: AllOf(vec![m1]),
@@ -527,14 +527,14 @@ fn ls_circuit_op_to_pbc_op(op: LoadStoreOp, next_id: &mut u32) -> Vec<PauliProdu
                 PauliProductOperation::Measurement {
                     axis: PauliAxis {
                         sign: One,
-                        pauli_string: PauliString::new(vec![(proc, Pauli::Z), (mem, Pauli::Z)]),
+                        pauli_string: PauliString::new(vec![(*proc, Pauli::Z), (*mem, Pauli::Z)]),
                     },
                     id: m0,
                 },
                 PauliProductOperation::ConditionalRotation {
                     axis: PauliAxis {
                         sign: One,
-                        pauli_string: PauliString::new(vec![(mem, Pauli::X)]),
+                        pauli_string: PauliString::new(vec![(*mem, Pauli::X)]),
                     },
                     angle: PiOver2,
                     condition: AllOf(vec![m0]),
@@ -542,14 +542,14 @@ fn ls_circuit_op_to_pbc_op(op: LoadStoreOp, next_id: &mut u32) -> Vec<PauliProdu
                 PauliProductOperation::Measurement {
                     axis: PauliAxis {
                         sign: One,
-                        pauli_string: PauliString::new(vec![(proc, Pauli::X)]),
+                        pauli_string: PauliString::new(vec![(*proc, Pauli::X)]),
                     },
                     id: m1,
                 },
                 PauliProductOperation::ConditionalRotation {
                     axis: PauliAxis {
                         sign: One,
-                        pauli_string: PauliString::new(vec![(mem, Pauli::Z)]),
+                        pauli_string: PauliString::new(vec![(*mem, Pauli::Z)]),
                     },
                     angle: PiOver2,
                     condition: AllOf(vec![m1]),
@@ -560,12 +560,12 @@ fn ls_circuit_op_to_pbc_op(op: LoadStoreOp, next_id: &mut u32) -> Vec<PauliProdu
     }
 }
 
-fn absorb_cliffords(circ: PauliProductCircuit) -> PauliProductCircuit {
+fn absorb_cliffords(circ: &PauliProductCircuit) -> PauliProductCircuit {
     let mut result = PauliProductCircuit::new();
     result.next_meas_id = circ.next_meas_id;
     let mut frame = CliffordFrame::new();
 
-    for ref instr in circ.instructions {
+    for ref instr in &circ.instructions {
         match instr {
             PauliProductOperation::FrameReset(q) => {
                 frame.reset(*q);
@@ -574,21 +574,21 @@ fn absorb_cliffords(circ: PauliProductCircuit) -> PauliProductCircuit {
                 axis,
                 angle: PiOver4,
             } => {
-                frame.update(&axis);
+                frame.update(axis);
             }
             PauliProductOperation::Rotation {
                 axis,
                 angle: PiOver2,
             } => {
-                frame.update(&axis);
-                frame.update(&axis);
+                frame.update(axis);
+                frame.update(axis);
             }
             PauliProductOperation::Rotation {
                 axis,
                 angle: PiOver8,
             } => {
                 result.instructions.push(PauliProductOperation::Rotation {
-                    axis: frame.apply(&axis),
+                    axis: frame.apply(axis),
                     angle: PiOver8,
                 });
             }
@@ -596,12 +596,12 @@ fn absorb_cliffords(circ: PauliProductCircuit) -> PauliProductCircuit {
                 // Dropped for now.
             }
             PauliProductOperation::Measurement { axis, id } => {
-                let effective = frame.apply(&axis);
+                let effective = frame.apply(axis);
                 result
                     .instructions
                     .push(PauliProductOperation::Measurement {
                         axis: effective,
-                        id : *id,
+                        id: *id,
                     });
             }
         }
@@ -611,11 +611,11 @@ fn absorb_cliffords(circ: PauliProductCircuit) -> PauliProductCircuit {
 }
 
 fn to_pauli_product_circuit(
-    load_store: LoadStoreCircuit,
+    load_store: &LoadStoreCircuit,
     simulate_corrections: bool,
 ) -> PauliProductCircuit {
     let mut circuit = PauliProductCircuit::new();
-    for op in load_store.ops {
+    for op in load_store.ops.iter() {
         let instrs = ls_circuit_op_to_pbc_op(op, &mut circuit.next_meas_id);
         circuit.instructions.extend(instrs.into_iter().filter(|i| {
             simulate_corrections || !matches!(i, PauliProductOperation::ConditionalRotation { .. })
@@ -624,12 +624,16 @@ fn to_pauli_product_circuit(
     circuit
 }
 
-fn resolve_corrections(circ: PauliProductCircuit) -> PauliProductCircuit {
+fn resolve_corrections(circ: &PauliProductCircuit) -> PauliProductCircuit {
     use std::collections::HashMap;
 
     let mut outcomes: HashMap<crate::pbc::MeasId, bool> = HashMap::new();
     for instr in &circ.instructions {
-        if let PauliProductOperation::ConditionalRotation { condition: AllOf(ids), .. } = instr {
+        if let PauliProductOperation::ConditionalRotation {
+            condition: AllOf(ids),
+            ..
+        } = instr
+        {
             for &id in ids {
                 outcomes.entry(id).or_insert_with(rand::random);
             }
@@ -638,21 +642,27 @@ fn resolve_corrections(circ: PauliProductCircuit) -> PauliProductCircuit {
 
     let mut result = PauliProductCircuit::new();
     result.next_meas_id = circ.next_meas_id;
-    for instr in circ.instructions {
+    for instr in &circ.instructions {
         match instr {
-            PauliProductOperation::ConditionalRotation { axis, angle, condition: AllOf(ref ids) } => {
+            PauliProductOperation::ConditionalRotation {
+                axis,
+                angle,
+                condition: AllOf(ids),
+            } => {
                 if ids.iter().all(|id| *outcomes.get(id).unwrap_or(&false)) {
-                    result.instructions.push(PauliProductOperation::Rotation { axis, angle });
+                    result
+                        .instructions
+                        .push(PauliProductOperation::Rotation { axis: axis.clone(), angle: *angle });
                 }
             }
-            other => result.instructions.push(other),
+            other => result.instructions.push(other.clone()),
         }
     }
     result
 }
 
 fn to_load_store_circuit(
-    subcircuits: Vec<Circuit>,
+    subcircuits: &[Circuit],
     max_subcircuit_size: usize,
     skip_redundant: bool,
 ) -> LoadStoreCircuit {
@@ -676,13 +686,19 @@ fn to_load_store_circuit(
         HashMap::new()
     };
 
-    for (i, sub) in subcircuits.into_iter().enumerate() {
+    for (i, sub) in subcircuits.iter().enumerate() {
         if skip_redundant {
             // Only evict enough qubits to free slots for the ones we need to load.
-            let new_count = sub.qubits.iter().filter(|q| !in_flight.contains_key(q)).count();
-            let must_evict = in_flight.len().saturating_sub(max_subcircuit_size - new_count);
+            let new_count = sub
+                .qubits
+                .iter()
+                .filter(|q| !in_flight.contains_key(q))
+                .count();
+            let must_evict = in_flight
+                .len()
+                .saturating_sub(max_subcircuit_size - new_count);
             if must_evict > 0 {
-                let eviction_candidates = rank_evictable_qubits(&in_flight, &next_use, i, &sub);
+                let eviction_candidates = rank_evictable_qubits(&in_flight, &next_use, i, sub);
                 for q in eviction_candidates.into_iter().take(must_evict) {
                     let proc = in_flight.remove(&q).unwrap();
                     ops.push(LoadStoreOp::Store(proc, ArchitectureQubit::Memory(q.0)));
@@ -690,11 +706,20 @@ fn to_load_store_circuit(
             }
 
             // Carried qubits hold specific processor slots; new qubits fill the gaps.
-            let used_slots: HashSet<usize> = in_flight.values()
-                .filter_map(|aq| if let ArchitectureQubit::Processor(s) = aq { Some(*s) } else { None })
+            let used_slots: HashSet<usize> = in_flight
+                .values()
+                .filter_map(|aq| {
+                    if let ArchitectureQubit::Processor(s) = aq {
+                        Some(*s)
+                    } else {
+                        None
+                    }
+                })
                 .collect();
             let mut free_slots = (0usize..).filter(|s| !used_slots.contains(s));
-            let mut to_load: Vec<_> = sub.qubits.iter()
+            let mut to_load: Vec<_> = sub
+                .qubits
+                .iter()
                 .filter(|q| !in_flight.contains_key(q))
                 .collect();
             to_load.sort_unstable_by_key(|q| q.0);
@@ -729,52 +754,74 @@ fn to_load_store_circuit(
     LoadStoreCircuit { ops }
 }
 
-fn rank_evictable_qubits(in_flight: &HashMap<Qubit, ArchitectureQubit>, next_use: &HashMap<Qubit, Vec<usize>>, i: usize, sub: &Circuit) -> Vec<Qubit> {
+fn rank_evictable_qubits(
+    in_flight: &HashMap<Qubit, ArchitectureQubit>,
+    next_use: &HashMap<Qubit, Vec<usize>>,
+    i: usize,
+    sub: &Circuit,
+) -> Vec<Qubit> {
     // next_use_after(q): the first subcircuit index strictly after i where q appears,
     // or usize::MAX if q is never used again.
     let next_use_after = |q: &Qubit| -> usize {
-        next_use.get(q)
+        next_use
+            .get(q)
             .and_then(|uses| {
                 let pos = uses.partition_point(|&u| u <= i);
                 uses.get(pos).copied()
             })
             .unwrap_or(usize::MAX)
     };
-    let mut evictable: Vec<Qubit> = in_flight.keys()
+    let mut evictable: Vec<Qubit> = in_flight
+        .keys()
         .filter(|q| !sub.qubits.contains(q))
         .cloned()
         .collect();
     // Sort descending by next future use so we evict furthest-future first.
     // Break ties by qubit index for determinism.
     evictable.sort_unstable_by(|a, b| {
-        next_use_after(b).cmp(&next_use_after(a)).then(b.0.cmp(&a.0))
+        next_use_after(b)
+            .cmp(&next_use_after(a))
+            .then(b.0.cmp(&a.0))
     });
     evictable
 }
 
 fn partition(
-    circ: &Circuit,
+    circ: Circuit,
     max_subcircuit_size: usize,
-    skip_redundant: bool,
     sat_mode: bool,
     sat_timeout: Option<u64>,
-) -> (Vec<Circuit>, bool) {
+) -> Vec<Circuit> {
     if !sat_mode {
-        return (get_processor_subcircuits(circ.clone(), max_subcircuit_size), skip_redundant);
+        return get_processor_subcircuits(circ, max_subcircuit_size);
     }
+    let gate_count = circ.gates.len();
     // Run greedy first to learn max_k and a tight initial upper bound on load/stores.
     // The greedy Belady count avoids wasting the first SAT call on an unconstrained solve.
     let greedy = get_processor_subcircuits(circ.clone(), max_subcircuit_size);
-    let max_k = (greedy.len() * 3/3).min(circ.gates.len().max(1));
-    let greedy_ls = to_load_store_circuit(greedy, max_subcircuit_size, true);
-    let initial_best_k = greedy_ls.ops.iter()
+    let max_k = (greedy.len() * 3 / 3).min(gate_count.max(1)); 
+
+    let greedy_ls = to_load_store_circuit(&greedy, max_subcircuit_size, true);
+    let initial_best_k = greedy_ls
+        .ops
+        .iter()
         .filter(|op| matches!(op, LoadStoreOp::Load(..) | LoadStoreOp::Store(..)))
         .count();
-    // SAT mode forces skip_redundant=true (required for Belady's optimality guarantee).
-    // Fall back to greedy if the solver finds no feasible assignment (e.g. capacity too tight).
-    match crate::sat_partition::slice_and_optimize(circ, max_subcircuit_size, max_k, 5,  Some(initial_best_k), sat_timeout) {
-        Some(subcircuits) =>  (subcircuits, true),
-        None => {eprintln!("SAT solving failed, falling back on greedy solution..."); (get_processor_subcircuits(circ.clone(), max_subcircuit_size), true)},
+    // Fall back to greedy if the solver finds no feasible assignment within the timeout or proves infeasibility (which shouldn't happen since greedy is a valid solution).
+    match crate::sat_partition::slice_and_optimize(
+        &circ,
+        max_subcircuit_size,
+        max_k,
+        32,
+        Some(initial_best_k),
+        sat_timeout,
+    ) {
+        Some(subcircuits) => subcircuits,
+        None => {
+            eprintln!("SAT solving failed, falling back on greedy solution...");
+
+            greedy
+        }
     }
 }
 
@@ -786,11 +833,15 @@ pub fn compile(
     sat_mode: bool,
     sat_timeout: Option<u64>,
 ) -> PauliProductCircuit {
-    let (subcircuits, effective_skip) = partition(&circ, max_subcircuit_size, skip_redundant, sat_mode, sat_timeout);
-    let load_store = to_load_store_circuit(subcircuits, max_subcircuit_size, effective_skip);
-    let pbc = to_pauli_product_circuit(load_store, simulate_corrections);
-    let resolved = if simulate_corrections { resolve_corrections(pbc) } else { pbc };
-    absorb_cliffords(resolved)
+    let subcircuits = partition(circ, max_subcircuit_size, sat_mode, sat_timeout);
+    let load_store = to_load_store_circuit(&subcircuits, max_subcircuit_size, skip_redundant);
+    let pbc = to_pauli_product_circuit(&load_store, simulate_corrections);
+    let resolved = if simulate_corrections {
+        resolve_corrections(&pbc)
+    } else {
+        pbc
+    };
+    absorb_cliffords(&resolved)
 }
 
 /// Returns (load_store, pbc_pre_clifford, pbc_final) for inspecting all intermediate stages.
@@ -802,29 +853,33 @@ pub fn compile_steps(
     sat_mode: bool,
     sat_timeout: Option<u64>,
 ) -> (LoadStoreCircuit, PauliProductCircuit, PauliProductCircuit) {
-    let (subcircuits, effective_skip) = partition(&circ, max_subcircuit_size, skip_redundant, sat_mode, sat_timeout);
+    let subcircuits = partition(circ, max_subcircuit_size, sat_mode, sat_timeout);
     println!("Subcircuit count: {}", subcircuits.len());
-    let load_store = to_load_store_circuit(subcircuits, max_subcircuit_size, effective_skip);
-    let load_store_saved = load_store.clone();
-    let load_store_count = load_store_saved.ops.iter().fold(0, |acc, x| match x  {
-        LoadStoreOp::Load(_, _) => acc+1,
-        LoadStoreOp::Store(_, _) => acc+1,
+    let load_store = to_load_store_circuit(&subcircuits, max_subcircuit_size, skip_redundant);
+    let load_store_count = load_store.ops.iter().fold(0, |acc, x| match x {
+        LoadStoreOp::Load(_, _) => acc + 1,
+        LoadStoreOp::Store(_, _) => acc + 1,
         LoadStoreOp::Gate(_) => acc,
-    } );
-    println!("Load store count: {load_store_count}"
-    );
-    let pbc = to_pauli_product_circuit(load_store, simulate_corrections);
-    let resolved = if simulate_corrections { resolve_corrections(pbc.clone()) } else { pbc.clone() };
-    let clifford_free = absorb_cliffords(resolved);
-    (load_store_saved, pbc, clifford_free)
+    });
+    println!("Load store count: {load_store_count}");
+    let pbc = to_pauli_product_circuit(&load_store, simulate_corrections);
+    let resolved = if simulate_corrections {
+        &resolve_corrections(&pbc)
+    } else {
+        &pbc
+    };
+    let clifford_free = absorb_cliffords(&resolved);
+    (load_store, pbc, clifford_free) 
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::circuit::{Circuit, Gate, Qubit};
-    use crate::pbc::{MeasId, PPRAngle, Pauli, PauliAxis, PauliProductCircuit, PauliProductOperation, PauliString};
     use crate::pbc::Sign::{self, One};
+    use crate::pbc::{
+        MeasId, PPRAngle, Pauli, PauliAxis, PauliProductCircuit, PauliProductOperation, PauliString,
+    };
     use crate::sat_partition::optimize_partition;
     use ArchitectureQubit::Processor;
 
@@ -837,7 +892,10 @@ mod tests {
     }
 
     fn count_ls(ls: &LoadStoreCircuit) -> usize {
-        ls.ops.iter().filter(|op| matches!(op, LoadStoreOp::Load(..) | LoadStoreOp::Store(..))).count()
+        ls.ops
+            .iter()
+            .filter(|op| matches!(op, LoadStoreOp::Load(..) | LoadStoreOp::Store(..)))
+            .count()
     }
 
     // --- greedy partitioner tests ---
@@ -845,7 +903,10 @@ mod tests {
     #[test]
     fn test_greedy_capacity_respected() {
         // 3 independent H gates; proc_cap=2 forces at least 2 subcircuits
-        let circ = make_circuit(3, vec![Gate::H(Qubit(0)), Gate::H(Qubit(1)), Gate::H(Qubit(2))]);
+        let circ = make_circuit(
+            3,
+            vec![Gate::H(Qubit(0)), Gate::H(Qubit(1)), Gate::H(Qubit(2))],
+        );
         let subs = get_processor_subcircuits(circ, 2);
         assert!(subs.len() >= 2, "expected at least 2 subcircuits");
         for sub in &subs {
@@ -855,7 +916,10 @@ mod tests {
 
     #[test]
     fn test_greedy_preserves_all_gates() {
-        let circ = make_circuit(3, vec![Gate::H(Qubit(0)), Gate::H(Qubit(1)), Gate::H(Qubit(2))]);
+        let circ = make_circuit(
+            3,
+            vec![Gate::H(Qubit(0)), Gate::H(Qubit(1)), Gate::H(Qubit(2))],
+        );
         let subs = get_processor_subcircuits(circ, 2);
         let total_gates: usize = subs.iter().map(|s| s.gates.len()).sum();
         assert_eq!(total_gates, 3);
@@ -868,7 +932,7 @@ mod tests {
         // sub0={q0,q1}, sub1={q0}: without skip every boundary is full load+store
         let sub0 = make_circuit(2, vec![Gate::H(Qubit(0)), Gate::H(Qubit(1))]);
         let sub1 = make_circuit(2, vec![Gate::H(Qubit(0))]);
-        let ls = to_load_store_circuit(vec![sub0, sub1], 2, false);
+        let ls = to_load_store_circuit(&vec![sub0, sub1], 2, false);
         // sub0: 2 loads + 2 stores; sub1: 1 load + 1 store
         assert_eq!(count_ls(&ls), 6);
     }
@@ -879,7 +943,7 @@ mod tests {
         // q0 stays; q1 is evicted (not needed in sub1); q2 is loaded → 3 loads + 1 store
         let sub0 = make_circuit(3, vec![Gate::H(Qubit(0)), Gate::H(Qubit(1))]);
         let sub1 = make_circuit(3, vec![Gate::H(Qubit(0)), Gate::H(Qubit(2))]);
-        let ls = to_load_store_circuit(vec![sub0, sub1], 2, true);
+        let ls = to_load_store_circuit(&vec![sub0, sub1], 2, true);
         assert_eq!(count_ls(&ls), 4);
     }
 
@@ -892,7 +956,7 @@ mod tests {
         let sub0 = make_circuit(3, vec![Gate::H(Qubit(0)), Gate::H(Qubit(1))]);
         let sub1 = make_circuit(3, vec![Gate::H(Qubit(2))]);
         let sub2 = make_circuit(3, vec![Gate::H(Qubit(0)), Gate::H(Qubit(2))]);
-        let ls = to_load_store_circuit(vec![sub0, sub1, sub2], 2, true);
+        let ls = to_load_store_circuit(&vec![sub0, sub1, sub2], 2, true);
         assert_eq!(count_ls(&ls), 4);
     }
 
@@ -903,20 +967,31 @@ mod tests {
         // DAG: H(qi) -> CNOT that uses qi
         // Greedy with proc_cap=2 yields 4 subcircuits, 12 load/store ops (with Belady skip).
         // SAT optimum rearranges into {q0,q2} / {q0,q2} / {q1,q3} / {q1,q3}, giving 6 ops.
-        make_circuit(4, vec![
-            Gate::H(Qubit(0)),
-            Gate::H(Qubit(1)),
-            Gate::H(Qubit(2)),
-            Gate::H(Qubit(3)),
-            Gate::CNOT { control: Qubit(0), target: Qubit(2) },
-            Gate::CNOT { control: Qubit(1), target: Qubit(3) },
-        ])
+        make_circuit(
+            4,
+            vec![
+                Gate::H(Qubit(0)),
+                Gate::H(Qubit(1)),
+                Gate::H(Qubit(2)),
+                Gate::H(Qubit(3)),
+                Gate::CNOT {
+                    control: Qubit(0),
+                    target: Qubit(2),
+                },
+                Gate::CNOT {
+                    control: Qubit(1),
+                    target: Qubit(3),
+                },
+            ],
+        )
     }
 
     #[test]
     fn test_sat_respects_capacity() {
         let circ = four_qubit_circuit();
-        let subs = optimize_partition(&circ, 2, 8, Some(12), None, &HashMap::new()).unwrap().0;
+        let subs = optimize_partition(&circ, 2, 8, Some(12), None, &HashMap::new())
+            .unwrap()
+            .0;
         for sub in &subs {
             assert!(sub.qubits.len() <= 2, "SAT subcircuit exceeds proc_cap=2");
         }
@@ -927,15 +1002,24 @@ mod tests {
         let circ = four_qubit_circuit();
         let greedy_subs = get_processor_subcircuits(circ.clone(), 2);
         let max_k = greedy_subs.len() * 2;
-        let greedy_count = count_ls(&to_load_store_circuit(greedy_subs, 2, true));
-        let sat_subs = optimize_partition(&circ, 2, max_k, Some(greedy_count), None, &HashMap::new()).unwrap().0;
-        let sat_count = count_ls(&to_load_store_circuit(sat_subs, 2, true));
-        assert!(sat_count < greedy_count, "SAT ({sat_count}) should beat greedy ({greedy_count})");
+        let greedy_count = count_ls(&to_load_store_circuit(&greedy_subs, 2, true));
+        let sat_subs =
+            optimize_partition(&circ, 2, max_k, Some(greedy_count), None, &HashMap::new())
+                .unwrap()
+                .0;
+        let sat_count = count_ls(&to_load_store_circuit(&sat_subs, 2, true));
+        assert!(
+            sat_count < greedy_count,
+            "SAT ({sat_count}) should beat greedy ({greedy_count})"
+        );
         assert_eq!(sat_count, 6, "expected optimal 4 loads + 2 stores = 6");
     }
 
     fn single(sign: Sign, q: ArchitectureQubit, p: Pauli) -> PauliAxis {
-        PauliAxis { sign, pauli_string: PauliString::new(vec![(q, p)]) }
+        PauliAxis {
+            sign,
+            pauli_string: PauliString::new(vec![(q, p)]),
+        }
     }
 
     fn rot(axis: PauliAxis, angle: PPRAngle) -> PauliProductOperation {
@@ -943,14 +1027,21 @@ mod tests {
     }
 
     fn meas(axis: PauliAxis, id: u32) -> PauliProductOperation {
-        PauliProductOperation::Measurement { axis, id: MeasId(id) }
+        PauliProductOperation::Measurement {
+            axis,
+            id: MeasId(id),
+        }
     }
 
     fn absorbed_meas(instrs: Vec<PauliProductOperation>) -> PauliAxis {
         let mut circ = PauliProductCircuit::new();
         circ.instructions = instrs;
-        let out = absorb_cliffords(circ);
-        assert_eq!(out.instructions.len(), 1, "expected exactly one output instruction");
+        let out = absorb_cliffords(&circ);
+        assert_eq!(
+            out.instructions.len(),
+            1,
+            "expected exactly one output instruction"
+        );
         match out.instructions.into_iter().next().unwrap() {
             PauliProductOperation::Measurement { axis, .. } => axis,
             other => panic!("expected Measurement, got {:?}", other),
@@ -966,13 +1057,13 @@ mod tests {
             meas(single(One, q, Pauli::Z), 0),
         ]);
 
-        let expected_sign =   One;
+        let expected_sign = One;
         let expected_pauli = Pauli::Y;
         assert_eq!(result.sign, expected_sign);
         assert_eq!(&*result.pauli_string, &[(q, expected_pauli)]);
     }
     #[test]
-        fn z_pi4_x_pi4_then_z_meas() {
+    fn z_pi4_x_pi4_then_z_meas() {
         let q = Processor(0);
         let result = absorbed_meas(vec![
             rot(single(One, q, Pauli::Z), PPRAngle::PiOver4),

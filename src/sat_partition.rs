@@ -269,7 +269,9 @@ pub fn optimize_partition(
                     })
                     .collect();
                 best_mem_state = (0..n_qubits)
-                    .map(|q| solver.lit_val(mem_lit(q, max_subcircuits - 1)).unwrap() == TernaryVal::True)
+                    .map(|q| {
+                        solver.lit_val(mem_lit(q, max_subcircuits - 1)).unwrap() == TernaryVal::True
+                    })
                     .collect();
                 best_assignment = Some(assignment);
                 best_cost = count;
@@ -306,8 +308,7 @@ pub fn optimize_partition(
         })
         .collect();
 
-    let final_mem: HashMap<Qubit, bool> =
-        qubits.iter().copied().zip(best_mem_state).collect();
+    let final_mem: HashMap<Qubit, bool> = qubits.iter().copied().zip(best_mem_state).collect();
 
     Some((subcircuits, final_mem))
 }
@@ -365,4 +366,62 @@ pub fn slice_and_optimize(
     }
 
     Some(result)
+}
+
+/// Like `slice_and_optimize` but solves all slices in parallel.
+/// Each slice gets the full `timeout_secs` budget; wall-clock time is bounded by the slowest slice.
+/// No inter-chunk boundary state is threaded (slices are independent).
+pub fn slice_and_optimize_parallel(
+    circ: &Circuit,
+    proc_cap: usize,
+    max_subcircuits: usize,
+    num_slices: usize,
+    initial_best_cost: Option<usize>,
+    timeout_secs: Option<u64>,
+) -> Option<Vec<Circuit>> {
+    if circ.gates.is_empty() || num_slices == 0 {
+        return Some(vec![]);
+    }
+
+    let n_gates = circ.gates.len();
+    let chunk_size = n_gates.div_ceil(num_slices);
+
+    let slices: Vec<Circuit> = (0..n_gates)
+        .step_by(chunk_size)
+        .map(|start| {
+            let end = (start + chunk_size).min(n_gates);
+            let mut s = Circuit::new(circ.num_qubits);
+            for idx in start..end {
+                s.apply(circ.gates[idx].clone());
+            }
+            s
+        })
+        .collect();
+
+    let results: Vec<Option<Vec<Circuit>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = slices
+            .iter()
+            .map(|slice| {
+                scope.spawn(|| {
+                    optimize_partition(
+                        slice,
+                        proc_cap,
+                         (max_subcircuits / num_slices) + 1, // per-slice subcircuit budget (heuristic)
+                        initial_best_cost,
+                        timeout_secs,
+                        &HashMap::new(),
+                    )
+                    .map(|(circuits, _)| circuits)
+                })
+            })
+            .collect();
+
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut all_circuits = Vec::new();
+    for result in results {
+        all_circuits.extend(result?);
+    }
+    Some(all_circuits)
 }
