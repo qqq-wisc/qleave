@@ -48,11 +48,11 @@ impl Circuit {
         for (i, gate) in self.gates.iter().enumerate() {
             let id = GateId(i);
             for q in gate.qubits() {
-                if let Some(pred) = last_on_qubit.get(&q).copied() {
-                    if seen_preds[i].insert(pred) {
-                        successors[pred.0].push(id);
-                        in_degree[i] += 1;
-                    }
+                if let Some(pred) = last_on_qubit.get(&q).copied()
+                    && seen_preds[i].insert(pred)
+                {
+                    successors[pred.0].push(id);
+                    in_degree[i] += 1;
                 }
                 last_on_qubit.insert(q, id);
             }
@@ -116,7 +116,11 @@ impl<A: Copy + fmt::Display> fmt::Display for Gate<A> {
             Gate::T(q) => write!(f, "T({q})"),
             Gate::Tdg(q) => write!(f, "Tdg({q})"),
             Gate::CNOT { control, target } => write!(f, "CNOT({control}, {target})"),
-            Gate::CCZ { control1, control2, target } => {
+            Gate::CCZ {
+                control1,
+                control2,
+                target,
+            } => {
                 write!(f, "CCZ({control1}, {control2}, {target})")
             }
         }

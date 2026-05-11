@@ -223,7 +223,7 @@ pub fn optimize_partition(
     let deadline = timeout_secs.map(|s| Instant::now() + Duration::from_secs(s));
 
     loop {
-        println!("best_cost so far: {best_cost}");
+        // println!("best_cost so far: {best_cost}");
         if best_cost == 0 {
             break;
         }
@@ -406,7 +406,7 @@ pub fn slice_and_optimize_parallel(
                     optimize_partition(
                         slice,
                         proc_cap,
-                         (max_subcircuits / num_slices) + 1, // per-slice subcircuit budget (heuristic)
+                        max_subcircuits,
                         initial_best_cost,
                         timeout_secs,
                         &HashMap::new(),

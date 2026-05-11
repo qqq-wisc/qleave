@@ -556,7 +556,7 @@ fn ls_circuit_op_to_pbc_op(op: &LoadStoreOp, next_id: &mut u32) -> Vec<PauliProd
                 },
             ]
         }
-        LoadStoreOp::Gate(gate) => gate_to_pbc_instructions(&gate, next_id),
+        LoadStoreOp::Gate(gate) => gate_to_pbc_instructions(gate, next_id),
     }
 }
 
@@ -650,9 +650,10 @@ fn resolve_corrections(circ: &PauliProductCircuit) -> PauliProductCircuit {
                 condition: AllOf(ids),
             } => {
                 if ids.iter().all(|id| *outcomes.get(id).unwrap_or(&false)) {
-                    result
-                        .instructions
-                        .push(PauliProductOperation::Rotation { axis: axis.clone(), angle: *angle });
+                    result.instructions.push(PauliProductOperation::Rotation {
+                        axis: axis.clone(),
+                        angle: *angle,
+                    });
                 }
             }
             other => result.instructions.push(other.clone()),
@@ -799,7 +800,7 @@ fn partition(
     // Run greedy first to learn max_k and a tight initial upper bound on load/stores.
     // The greedy Belady count avoids wasting the first SAT call on an unconstrained solve.
     let greedy = get_processor_subcircuits(circ.clone(), max_subcircuit_size);
-    let max_k = (greedy.len() * 3 / 3).min(gate_count.max(1)); 
+    let max_k = (greedy.len() * 3 / 3).min(gate_count.max(1));
 
     let greedy_ls = to_load_store_circuit(&greedy, max_subcircuit_size, true);
     let initial_best_k = greedy_ls
@@ -812,7 +813,7 @@ fn partition(
         &circ,
         max_subcircuit_size,
         max_k,
-        32,
+        3,
         Some(initial_best_k),
         sat_timeout,
     ) {
@@ -868,8 +869,8 @@ pub fn compile_steps(
     } else {
         &pbc
     };
-    let clifford_free = absorb_cliffords(&resolved);
-    (load_store, pbc, clifford_free) 
+    let clifford_free = absorb_cliffords(resolved);
+    (load_store, pbc, clifford_free)
 }
 
 #[cfg(test)]
