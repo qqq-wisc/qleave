@@ -187,7 +187,7 @@ fn gate_to_pbc_instructions(
                         sign: One,
                         pauli_string: PauliString::new(vec![
                             (*q, Pauli::Z),
-                            (ArchitectureQubit::Magic(0), Pauli::X),
+                            (ArchitectureQubit::Magic(0), Pauli::Z),
                         ]),
                     },
                     id: m0,
@@ -231,7 +231,7 @@ fn gate_to_pbc_instructions(
                         sign: NegOne,
                         pauli_string: PauliString::new(vec![
                             (*q, Pauli::Z),
-                            (ArchitectureQubit::Magic(0), Pauli::X),
+                            (ArchitectureQubit::Magic(0), Pauli::Z),
                         ]),
                     },
                     id: m0,
@@ -597,8 +597,6 @@ fn absorb_cliffords(circ: &PauliProductCircuit) -> PauliProductCircuit {
             }
             PauliProductOperation::Measurement { axis, id } => {
                 let effective = frame.apply(axis);
-                println!("Effective measurement axis for {id:?}: {effective}");
-                println!("Clifford frame at measurement: {frame:?}");
                 result
                     .instructions
                     .push(PauliProductOperation::Measurement {
@@ -826,6 +824,12 @@ fn partition(
             greedy
         }
     }
+}
+
+fn parallelize_rotation_synthesis(circ : PauliProductCircuit, synthesis_qubits : &[ArchitectureQubit]) -> PauliProductCircuit {
+    // Placeholder for future work on parallelizing rotation synthesis.
+    // For now we just return the input circuit unchanged.
+    circ
 }
 
 pub fn compile(

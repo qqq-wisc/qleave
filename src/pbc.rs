@@ -467,7 +467,6 @@ impl CliffordFrame {
                     return None;
                 }
                 let prod = pauli_string_mult(&rotation.pauli_string, &row.pauli_string);
-                println!("Updating frame for {q}: row {row}, rotation {rotation}, prod {prod}");
                 let sign = Sign::J * prod.sign * row.sign * rotation.sign;
                 let new_axis = self.apply(&PauliAxis { sign, pauli_string: prod.pauli_string });
                 Some((q, new_axis))
