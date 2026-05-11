@@ -420,54 +420,62 @@ impl CliffordFrame {
     /// Also initializes frame entries for qubits in `rotation` whose default basis
     /// element anti-commutes with the rotation.
     pub fn update(&mut self, rotation: &PauliAxis) {
-        let rot_qubits = rotation.pauli_string.iter().map(|&(q, _)| q);
+        let rot_qubits: Vec<_> = rotation.pauli_string.iter().map(|&(q, _)| q).collect();
 
         let x_qubits: Vec<_> = self
             .x
             .keys()
             .cloned()
-            .chain(rot_qubits.clone())
+            .chain(rot_qubits.iter().cloned())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        for q in x_qubits {
-            let row = PauliAxis {
-                sign: Sign::One,
-                pauli_string: PauliString::new(vec![(q, Pauli::X)]),
-            };
-            if !axes_commute(&row.pauli_string, &rotation.pauli_string) {
-                let prod = pauli_string_mult(&rotation.pauli_string, &row.pauli_string);
-                let sign = Sign::J * prod.sign * row.sign * rotation.sign;
-                let new_axis: PauliAxis = self.apply(&PauliAxis {
-                    sign,
-                    pauli_string: prod.pauli_string,
-                });
-                self.x.insert(q, new_axis);
-            }
-        }
         let z_qubits: Vec<_> = self
             .z
             .keys()
             .cloned()
-            .chain(rot_qubits)
+            .chain(rot_qubits.into_iter())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        for q in z_qubits {
-            let row = PauliAxis {
-                sign: Sign::One,
-                pauli_string: PauliString::new(vec![(q, Pauli::Z)]),
-            };
-            if !axes_commute(&row.pauli_string, &rotation.pauli_string) {
+
+        let new_x: Vec<_> = x_qubits
+            .into_iter()
+            .filter_map(|q| {
+                let row = PauliAxis {
+                    sign: Sign::One,
+                    pauli_string: PauliString::new(vec![(q, Pauli::X)]),
+                };
+                if axes_commute(&row.pauli_string, &rotation.pauli_string) {
+                    return None;
+                }
                 let prod = pauli_string_mult(&rotation.pauli_string, &row.pauli_string);
                 let sign = Sign::J * prod.sign * row.sign * rotation.sign;
-                let new_axis = self.apply(&PauliAxis {
-                    sign,
-                    pauli_string: prod.pauli_string,
-                });
-                self.z.insert(q, new_axis);
-            }
-        }
+                let new_axis = self.apply(&PauliAxis { sign, pauli_string: prod.pauli_string });
+                Some((q, new_axis))
+            })
+            .collect();
+
+        let new_z: Vec<_> = z_qubits
+            .into_iter()
+            .filter_map(|q| {
+                let row = PauliAxis {
+                    sign: Sign::One,
+                    pauli_string: PauliString::new(vec![(q, Pauli::Z)]),
+                };
+                if axes_commute(&row.pauli_string, &rotation.pauli_string) {
+                    return None;
+                }
+                let prod = pauli_string_mult(&rotation.pauli_string, &row.pauli_string);
+                println!("Updating frame for {q}: row {row}, rotation {rotation}, prod {prod}");
+                let sign = Sign::J * prod.sign * row.sign * rotation.sign;
+                let new_axis = self.apply(&PauliAxis { sign, pauli_string: prod.pauli_string });
+                Some((q, new_axis))
+            })
+            .collect();
+
+        self.x.extend(new_x);
+        self.z.extend(new_z);
     }
 
     /// Clears the frame entries for `q` (called when `q` is loaded from memory).

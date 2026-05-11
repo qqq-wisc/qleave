@@ -597,6 +597,8 @@ fn absorb_cliffords(circ: &PauliProductCircuit) -> PauliProductCircuit {
             }
             PauliProductOperation::Measurement { axis, id } => {
                 let effective = frame.apply(axis);
+                println!("Effective measurement axis for {id:?}: {effective}");
+                println!("Clifford frame at measurement: {frame:?}");
                 result
                     .instructions
                     .push(PauliProductOperation::Measurement {
@@ -1049,6 +1051,19 @@ mod tests {
         }
     }
 
+    fn absorbed_meas_vec(instrs: Vec<PauliProductOperation>) -> Vec<PauliAxis> {
+        let mut circ = PauliProductCircuit::new();
+        circ.instructions = instrs;
+        let out = absorb_cliffords(&circ);
+        out.instructions
+            .into_iter()
+            .map(|instr| match instr {
+                PauliProductOperation::Measurement { axis, .. } => axis,
+                other => panic!("expected Measurement, got {:?}", other),
+            })
+            .collect()
+    }
+
     #[test]
     fn x_pi4_z_pi4_then_z_meas() {
         let q = Processor(0);
@@ -1076,5 +1091,112 @@ mod tests {
         let expected_pauli = Pauli::X;
         assert_eq!(result.sign, expected_sign);
         assert_eq!(&*result.pauli_string, &[(q, expected_pauli)]);
+    }
+        #[test]
+        fn y_pi4_then_y_meas() {
+        let q = Processor(0);
+        let result = absorbed_meas(vec![
+            rot(single(One, q, Pauli::Y), PPRAngle::PiOver4),
+            meas(single(One, q, Pauli::Y), 0),
+        ]);
+        println!("Result of Y π/4 then Y meas: {result:?}");
+        let expected_sign = Sign::One;
+        let expected_pauli = Pauli::Y;
+        assert_eq!(result.sign, expected_sign);
+        assert_eq!(&*result.pauli_string, &[(q, expected_pauli)]);
+    }
+    #[test]
+    fn z_pi4_xpi4_then_z_meas_twice()  {
+        let res = absorbed_meas_vec(vec![
+            rot(single(One, Processor(0), Pauli::Z), PPRAngle::PiOver4),
+            rot(single(One, Processor(0), Pauli::X), PPRAngle::PiOver4),
+            meas(single(One, Processor(0), Pauli::Z), 0),
+            meas(single(One, Processor(0), Pauli::Z), 1),
+        ]);
+        assert_eq!(res.len(), 2, "expected two measurements");
+        let expected_sign = One;
+        let expected_pauli = Pauli::X;
+        for axis in res {
+            assert_eq!(axis.sign, expected_sign);
+            assert_eq!(&*axis.pauli_string, &[(Processor(0), expected_pauli)]);
+        }
+    }
+
+    // Commuting case: Z π/4 before Z meas — Z commutes with Z, frame untouched.
+    #[test]
+    fn z_pi4_before_z_meas_commutes() {
+        let q = Processor(0);
+        let result = absorbed_meas(vec![
+            rot(single(One, q, Pauli::Z), PPRAngle::PiOver4),
+            meas(single(One, q, Pauli::Z), 0),
+        ]);
+        assert_eq!(result.sign, One);
+        assert_eq!(&*result.pauli_string, &[(q, Pauli::Z)]);
+    }
+
+    // Z π/4 before X meas: Z and X anti-commute, X basis maps to -Y.
+    #[test]
+    fn z_pi4_before_x_meas() {
+        let q = Processor(0);
+        let result = absorbed_meas(vec![
+            rot(single(One, q, Pauli::Z), PPRAngle::PiOver4),
+            meas(single(One, q, Pauli::X), 0),
+        ]);
+        assert_eq!(result.sign, Sign::NegOne);
+        assert_eq!(&*result.pauli_string, &[(q, Pauli::Y)]);
+    }
+
+    // X π/4 before Z meas: X and Z anti-commute, Z basis maps to +Y.
+    #[test]
+    fn x_pi4_before_z_meas() {
+        let q = Processor(0);
+        let result = absorbed_meas(vec![
+            rot(single(One, q, Pauli::X), PPRAngle::PiOver4),
+            meas(single(One, q, Pauli::Z), 0),
+        ]);
+        assert_eq!(result.sign, One);
+        assert_eq!(&*result.pauli_string, &[(q, Pauli::Y)]);
+    }
+
+    // Z π/2 (two π/4 updates) before X meas: applies S twice, maps X to -X.
+    #[test]
+    fn z_pi2_before_x_meas() {
+        let q = Processor(0);
+        let result = absorbed_meas(vec![
+            rot(single(One, q, Pauli::Z), PPRAngle::PiOver2),
+            meas(single(One, q, Pauli::X), 0),
+        ]);
+        assert_eq!(result.sign, Sign::NegOne);
+        assert_eq!(&*result.pauli_string, &[(q, Pauli::X)]);
+    }
+
+    // Negative-sign correction: R(-Z, π/4) before X meas flips the outcome sign vs R(+Z, π/4).
+    #[test]
+    fn neg_z_pi4_before_x_meas() {
+        let q = Processor(0);
+        let result = absorbed_meas(vec![
+            rot(single(Sign::NegOne, q, Pauli::Z), PPRAngle::PiOver4),
+            meas(single(One, q, Pauli::X), 0),
+        ]);
+        assert_eq!(result.sign, One);
+        assert_eq!(&*result.pauli_string, &[(q, Pauli::Y)]);
+    }
+
+    // Two-qubit ZZ Clifford before single-qubit X meas: the X[q0] basis element
+    // anti-commutes with Z[q0]Z[q1] (one anti-commuting site), so it maps to -Y[q0]Z[q1].
+    #[test]
+    fn zz_pi4_before_x_meas_on_first_qubit() {
+        let q0 = Processor(0);
+        let q1 = Processor(1);
+        let zz_axis = PauliAxis {
+            sign: One,
+            pauli_string: PauliString::new(vec![(q0, Pauli::Z), (q1, Pauli::Z)]),
+        };
+        let result = absorbed_meas(vec![
+            rot(zz_axis, PPRAngle::PiOver4),
+            meas(single(One, q0, Pauli::X), 0),
+        ]);
+        assert_eq!(result.sign, Sign::NegOne);
+        assert_eq!(&*result.pauli_string, &[(q0, Pauli::Y), (q1, Pauli::Z)]);
     }
 }
