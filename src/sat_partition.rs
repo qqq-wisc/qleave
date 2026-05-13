@@ -1,7 +1,10 @@
 use crate::circuit::{Circuit, Qubit};
 use rustsat::{
     clause,
-    encodings::card::{BoundUpper, Totalizer},
+    encodings::{
+        am1::{Encode as Am1Encode, Ladder},
+        card::{BoundUpper, Totalizer},
+    },
     instances::{BasicVarManager, Cnf},
     solvers::{Interrupt, InterruptSolver, Solve, SolveIncremental, SolverResult},
     types::{Clause, Lit, TernaryVal, Var},
@@ -73,14 +76,15 @@ pub fn optimize_partition(
     let mut clauses = Cnf::new();
     let mut var_mgr = BasicVarManager::from_next_free(Var::new(n_base));
 
-    // 1. all_gates_executed: exactly one subcircuit per gate
+    // 1. all_gates_executed: exactly one subcircuit per gate.
+    // ALO clause + Ladder (Sinz sequential) AMO encoding: O(k) clauses and aux vars,
+    // arc-consistent under unit propagation.
     for i in 0..n_gates {
         let alo: Clause = (0..max_subcircuits).map(|j| gate_lit(i, j)).collect();
         clauses.add_clause(alo);
-        for a in 0..max_subcircuits {
-            for b in (a + 1)..max_subcircuits {
-                clauses.add_clause(clause![!gate_lit(i, a), !gate_lit(i, b)]);
-            }
+        if max_subcircuits > 1 {
+            let mut amo: Ladder = (0..max_subcircuits).map(|j| gate_lit(i, j)).collect();
+            amo.encode(&mut clauses, &mut var_mgr).unwrap();
         }
     }
 
@@ -223,7 +227,7 @@ pub fn optimize_partition(
     let deadline = timeout_secs.map(|s| Instant::now() + Duration::from_secs(s));
 
     loop {
-        // println!("best_cost so far: {best_cost}");
+        println!("best_cost so far: {best_cost}");
         if best_cost == 0 {
             break;
         }

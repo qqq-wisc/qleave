@@ -826,12 +826,6 @@ fn partition(
     }
 }
 
-fn parallelize_rotation_synthesis(circ : PauliProductCircuit, synthesis_qubits : &[ArchitectureQubit]) -> PauliProductCircuit {
-    // Placeholder for future work on parallelizing rotation synthesis.
-    // For now we just return the input circuit unchanged.
-    circ
-}
-
 pub fn compile(
     circ: Circuit,
     max_subcircuit_size: usize,
@@ -1174,6 +1168,18 @@ mod tests {
         assert_eq!(&*result.pauli_string, &[(q, Pauli::X)]);
     }
 
+    // X π/2 (two π/4 updates) before Z meas: applies S twice, maps Z to -Z.
+    #[test]
+    fn x_pi2_before_z_meas() {
+        let q = Processor(0);
+        let result = absorbed_meas(vec![
+            rot(single(One, q, Pauli::X), PPRAngle::PiOver2),
+            meas(single(One, q, Pauli::Z), 0),
+        ]);
+        assert_eq!(result.sign, Sign::NegOne);
+        assert_eq!(&*result.pauli_string, &[(q, Pauli::Z)]);
+    }
+
     // Negative-sign correction: R(-Z, π/4) before X meas flips the outcome sign vs R(+Z, π/4).
     #[test]
     fn neg_z_pi4_before_x_meas() {
@@ -1184,6 +1190,32 @@ mod tests {
         ]);
         assert_eq!(result.sign, One);
         assert_eq!(&*result.pauli_string, &[(q, Pauli::Y)]);
+    }
+    #[test]
+    fn hadamard_test_x(){
+        let q = Processor(0);
+        let result = absorbed_meas(vec![
+            rot(single(One, q, Pauli::Z), PPRAngle::PiOver4),
+            rot(single(One, q, Pauli::X), PPRAngle::PiOver4),
+            rot(single(One, q, Pauli::Z), PPRAngle::PiOver4),
+            meas(single(One, q, Pauli::X), 0),
+        ]);
+        // H π/4 maps X to (X+Z)/√2, which anti-commutes with X on the X term but commutes on the Z term, so we get a +Y component and no sign flip.
+        assert_eq!(result.sign, One);
+        assert_eq!(&*result.pauli_string, &[(q, Pauli::Z)]);
+    }
+    #[test]
+    fn hadamard_test_z(){
+        let q = Processor(0);
+        let result = absorbed_meas(vec![
+            rot(single(One, q, Pauli::Z), PPRAngle::PiOver4),
+            rot(single(One, q, Pauli::X), PPRAngle::PiOver4),
+            rot(single(One, q, Pauli::Z), PPRAngle::PiOver4),
+            meas(single(One, q, Pauli::Z), 0),
+        ]);
+        // H π/4 maps X to (X+Z)/√2, which anti-commutes with X on the X term but commutes on the Z term, so we get a +Y component and no sign flip.
+        assert_eq!(result.sign, One);
+        assert_eq!(&*result.pauli_string, &[(q, Pauli::X)]);
     }
 
     // Two-qubit ZZ Clifford before single-qubit X meas: the X[q0] basis element

@@ -449,9 +449,12 @@ impl CliffordFrame {
                 if axes_commute(&row.pauli_string, &rotation.pauli_string) {
                     return None;
                 }
-                let prod = pauli_string_mult(&rotation.pauli_string, &row.pauli_string);
-                let sign = Sign::J * prod.sign * row.sign * rotation.sign;
-                let new_axis = self.apply(&PauliAxis { sign, pauli_string: prod.pauli_string });
+                let row_image = self.apply(&row); // should be self.apply(&row)
+                let rotation_image = self.apply(&rotation);
+                let prod = pauli_string_mult(&rotation_image.pauli_string, &row_image.pauli_string);
+                let sign = Sign::J * prod.sign * row_image.sign * rotation_image.sign;
+                // let new_axis = self.apply(&PauliAxis { sign, pauli_string: prod.pauli_string });
+                let new_axis = PauliAxis { sign, pauli_string: prod.pauli_string };
                 Some((q, new_axis))
             })
             .collect();
@@ -466,9 +469,12 @@ impl CliffordFrame {
                 if axes_commute(&row.pauli_string, &rotation.pauli_string) {
                     return None;
                 }
-                let prod = pauli_string_mult(&rotation.pauli_string, &row.pauli_string);
-                let sign = Sign::J * prod.sign * row.sign * rotation.sign;
-                let new_axis = self.apply(&PauliAxis { sign, pauli_string: prod.pauli_string });
+                let row_image = self.apply(&row);
+                let rotation_image = self.apply(&rotation);
+                let prod = pauli_string_mult(&rotation_image.pauli_string, &row_image.pauli_string);
+                let sign = Sign::J * prod.sign * row_image.sign * rotation_image.sign;
+                // let new_axis = self.apply(&PauliAxis { sign, pauli_string: prod.pauli_string });
+                let new_axis = PauliAxis { sign, pauli_string: prod.pauli_string };
                 Some((q, new_axis))
             })
             .collect();
