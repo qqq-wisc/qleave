@@ -1,5 +1,5 @@
 [package]
-name = "oratomic-compiler"
+name = "qleave"
 version = "0.1.0"
 edition = "2024"
 

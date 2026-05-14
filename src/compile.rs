@@ -1097,7 +1097,6 @@ mod tests {
             rot(single(One, q, Pauli::Y), PPRAngle::PiOver4),
             meas(single(One, q, Pauli::Y), 0),
         ]);
-        println!("Result of Y π/4 then Y meas: {result:?}");
         let expected_sign = Sign::One;
         let expected_pauli = Pauli::Y;
         assert_eq!(result.sign, expected_sign);

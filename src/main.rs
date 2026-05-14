@@ -1,10 +1,10 @@
 use clap::{Parser, ValueEnum};
-use oratomic_compiler::{
+use qleave::{
     arch::{BALANCED_LP_20, BALANCED_LP_24, SPACE_EFFICIENT_LP_20, SPACE_EFFICIENT_LP_24},
     compile::{compile, compile_steps},
     parse::parse,
 };
-use std::{fs, path::PathBuf, process};
+use std::{fs, io::{self, Write}, path::{Path, PathBuf}, process};
 
 #[derive(Clone, ValueEnum)]
 enum Arch {
@@ -32,9 +32,14 @@ struct Cli {
     #[arg(long, requires = "mem_cap")]
     proc_cap: Option<usize>,
 
-    /// Write intermediate circuits to this directory (default: "out")
-    #[arg(long, num_args = 0..=1, default_missing_value = "out")]
-    intermediates: Option<PathBuf>,
+    /// Output path for the compiled circuit. Use "-" for stdout. Defaults to <input_stem>.pbc in cwd.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Write intermediate circuits to this directory.
+    /// If passed without a value, defaults to <input_stem>-intermediates/.
+    #[arg(long, num_args = 0..=1, default_missing_value = "<auto>")]
+    intermediates: Option<String>,
 
     /// Randomly resolve conditional rotations to unconditional ones before applying the Clifford frame
     #[arg(long)]
@@ -94,7 +99,23 @@ fn main() {
         process::exit(1);
     }
 
-    if let Some(dir) = cli.intermediates {
+    let output_path = cli.output.unwrap_or_else(|| {
+        let stem = cli.circuit.file_stem().unwrap_or_default();
+        PathBuf::from(stem).with_extension("pbc")
+    });
+
+    let intermediates_dir = cli.intermediates.map(|s| {
+        if s == "<auto>" {
+            let stem = cli.circuit.file_stem().unwrap_or_default();
+            let mut name = stem.to_os_string();
+            name.push("-intermediates");
+            PathBuf::from(name)
+        } else {
+            PathBuf::from(s)
+        }
+    });
+
+    let pbc_final = if let Some(dir) = intermediates_dir {
         fs::create_dir_all(&dir).unwrap_or_else(|e| {
             eprintln!("error creating intermediates dir: {e}");
             process::exit(1);
@@ -110,7 +131,6 @@ fn main() {
         let writes = [
             ("load_store.txt", load_store.to_string()),
             ("pbc_w_clifford.txt", pbc_pre.to_string()),
-            ("final_res.txt", pbc_final.to_string()),
         ];
         for (name, content) in writes {
             fs::write(dir.join(name), content).unwrap_or_else(|e| {
@@ -118,22 +138,38 @@ fn main() {
                 process::exit(1);
             });
         }
-        println!("Final instruction count: {}", pbc_final.instructions.len());
-        println!(
-            "Results written to {}/ directory.",
-            dir.to_str().unwrap(),
-        )
+        eprintln!("intermediates written to {}/", dir.display());
+        pbc_final
     } else {
-        println!(
-            "{}",
-            compile(
-                circuit,
-                proc_cap,
-                cli.simulate_corrections,
-                cli.skip_redundant_ls || cli.sat, // If using SAT, we must skip redundant load/stores to guarantee optimality (Belady's algorithm)
-                cli.sat,
-                cli.sat_timeout,
-            )
+        compile(
+            circuit,
+            proc_cap,
+            cli.simulate_corrections,
+            cli.skip_redundant_ls || cli.sat, // If using SAT, we must skip redundant load/stores to guarantee optimality (Belady's algorithm)
+            cli.sat,
+            cli.sat_timeout,
+        )
+    };
+
+    if output_path == Path::new("-") {
+        let stdout = io::stdout();
+        let mut h = stdout.lock();
+        if let Err(e) = writeln!(h, "{pbc_final}") {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                process::exit(0);
+            }
+            eprintln!("error writing to stdout: {e}");
+            process::exit(1);
+        }
+    } else {
+        fs::write(&output_path, pbc_final.to_string()).unwrap_or_else(|e| {
+            eprintln!("error writing {}: {e}", output_path.display());
+            process::exit(1);
+        });
+        eprintln!(
+            "Wrote {} instructions to {}",
+            pbc_final.instructions.len(),
+            output_path.display()
         );
     }
 }
