@@ -51,10 +51,10 @@ Targets are described by a `(memory_capacity, processor_capacity)` pair. Built-i
 
 | Preset                  | Memory | Processor |
 | ----------------------- | ------ | --------- |
-| `space-efficient-lp-20` | 1124   | 10        |
-| `space-efficient-lp-24` | 1480   | 10        |
-| `balanced-lp-20`        | 1124   | 148       |
-| `balanced-lp-24`        | 1480   | 148       |
+| `space-efficient-lp20` | 1124   | 10        |
+| `space-efficient-lp24` | 1480   | 10        |
+| `balanced-lp20`        | 1124   | 148       |
+| `balanced-lp24`        | 1480   | 148       |
 
 Select one with `--arch <preset>`, or specify custom capacities with `--mem-cap <N> --proc-cap <M>`.
 
@@ -72,7 +72,7 @@ Select one with `--arch <preset>`, or specify custom capacities with `--mem-cap 
 ### Example
 
 ```sh
-qleave circuits/qft_16.qasm --arch space-efficient-lp-20 --intermediates
+qleave circuits/qft_16.qasm --arch space-efficient-lp20 --intermediates
 ```
 
 ## Repository layout
