@@ -21,7 +21,11 @@ This compiler implements the compilation scheme described by Cain et al. as the 
 
 ## Optimizations
 
-**Load/Store minimization.** ``qleave`` can optimize the number of inserted load/store instructions, and consequently the total depth of the final Pauli Product Measurement sequence. For lightweight optimization, the ``--skip-redundant-ls`` flag simply leaves qubits that appear in consecutive subcircuits in the processor block, rather than storing and immediately reloading, as suggested in Appendix E of the paper. For further reduction, the ``--sat`` flag replaces the default greedy partitioning pass with a SAT-based search. In this mode, ``qleave`` makes iterative calls to the CaDiCal SAT solver to find the circuit partition that minimizes the total load/store count. For large inputs, SAT solving may not terminate within a reasonable time bound, so it's wise to control the time budget with the ``--sat-timeout`` flag. When this timeout expires, the solver is interrupted and returns the best solution found so far.
+**Load/Store minimization.** ``qleave`` can optimize the number of inserted load/store instructions, and consequently the total depth of the final Pauli Product Measurement sequence. 
+
+``--skip-redundant-ls``: For lightweight optimization, the ``--skip-redundant-ls`` flag simply leaves qubits that appear in consecutive subcircuits in the processor block, rather than storing and immediately reloading, as suggested in Appendix E of the paper. 
+
+``--sat``: For further reduction, the ``--sat`` flag replaces the default greedy partitioning pass with a SAT-based search. In this mode, ``qleave`` makes iterative calls to the CaDiCal SAT solver to find the circuit partition that minimizes the total load/store count. For large inputs, SAT solving may not terminate within a reasonable time bound, so it's wise to control the time budget with the ``--sat-timeout`` flag. When this timeout expires, the solver is interrupted and returns the best solution found so far.
 
 ## Installation
 
