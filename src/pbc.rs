@@ -55,6 +55,8 @@ pub enum ArchitectureQubit {
     Magic(usize),
 }
 
+impl PauliStringIndex for ArchitectureQubit {}
+
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Hash)]
 pub enum Sign {
     One,
@@ -79,17 +81,19 @@ impl std::ops::Mul for Sign {
     }
 }
 #[derive(Clone, Debug)]
-pub struct PauliString(Vec<(ArchitectureQubit, Pauli)>);
+pub struct PauliString<A>(Vec<(A, Pauli)>);
 
-impl PauliString {
-    pub fn new(mut pairs: Vec<(ArchitectureQubit, Pauli)>) -> Self {
+pub trait PauliStringIndex: Copy + std::cmp::Ord {}
+
+impl<A: PauliStringIndex> PauliString<A> {
+    pub fn new(mut pairs: Vec<(A, Pauli)>) -> Self {
         pairs.sort_unstable_by_key(|&(q, _)| q);
         Self(pairs)
     }
 }
 
-impl std::ops::Deref for PauliString {
-    type Target = [(ArchitectureQubit, Pauli)];
+impl<A: PauliStringIndex> std::ops::Deref for PauliString<A> {
+    type Target = [(A, Pauli)];
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -108,7 +112,7 @@ fn pauli_mul(a: Pauli, b: Pauli) -> (Sign, Pauli) {
     }
 }
 
-pub fn pauli_string_mult(a: &PauliString, b: &PauliString) -> PauliAxis {
+pub fn pauli_string_mult<A: PauliStringIndex>(a: &PauliString<A>, b: &PauliString<A>) -> PauliAxis<A> {
     let mut sign = Sign::One;
     let mut out = Vec::new();
     let mut ai = a.iter().peekable();
@@ -151,7 +155,7 @@ pub fn pauli_string_mult(a: &PauliString, b: &PauliString) -> PauliAxis {
     }
 }
 
-pub fn axes_commute(a: &PauliString, b: &PauliString) -> bool {
+pub fn axes_commute<A: PauliStringIndex>(a: &PauliString<A>, b: &PauliString<A>) -> bool {
     // Two Pauli products commute iff an even number of qubit sites anti-commute.
     let mut anti = 0usize;
     let mut ai = a.iter().peekable();
@@ -186,25 +190,25 @@ pub fn axes_commute(a: &PauliString, b: &PauliString) -> bool {
     anti.is_multiple_of(2)
 }
 #[derive(Clone, Debug)]
-pub struct PauliAxis {
+pub struct PauliAxis<A> {
     pub sign: Sign,
-    pub pauli_string: PauliString,
+    pub pauli_string: PauliString<A>,
 }
 #[derive(Clone, Debug)]
 pub enum PauliProductOperation {
     Rotation {
-        axis: PauliAxis,
+        axis: PauliAxis<ArchitectureQubit>,
         angle: PPRAngle,
     },
     /// Classically-controlled Clifford correction: apply iff ALL bits in condition are 1.
     /// Only PiOver4 (Clifford) angles are meaningful here; PiOver2 corrections are software-only.
     ConditionalRotation {
-        axis: PauliAxis,
+        axis: PauliAxis<ArchitectureQubit>,
         angle: PPRAngle,
         condition: AllOf,
     },
     Measurement {
-        axis: PauliAxis,
+        axis: PauliAxis<ArchitectureQubit>,
         id: MeasId,
     },
     /// Internal compiler marker: clear the Clifford frame for this qubit.
@@ -259,7 +263,7 @@ impl fmt::Display for ArchitectureQubit {
     }
 }
 
-impl fmt::Display for PauliString {
+impl<A : fmt::Display> fmt::Display for PauliString<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, (q, p)) in self.0.iter().enumerate() {
             if i > 0 {
@@ -271,7 +275,7 @@ impl fmt::Display for PauliString {
     }
 }
 
-impl fmt::Display for PauliAxis {
+impl<A : fmt::Display> fmt::Display for PauliAxis<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}{}", self.sign, self.pauli_string)
     }
@@ -337,8 +341,8 @@ impl fmt::Display for PauliProductOperation {
 /// Absent qubits are identity (X[q]→X[q], Z[q]→Z[q]).
 #[derive(Debug)]
 pub struct CliffordFrame {
-    x: std::collections::HashMap<ArchitectureQubit, PauliAxis>,
-    z: std::collections::HashMap<ArchitectureQubit, PauliAxis>,
+    x: std::collections::HashMap<ArchitectureQubit, PauliAxis<ArchitectureQubit>>,
+    z: std::collections::HashMap<ArchitectureQubit, PauliAxis<ArchitectureQubit>>,
 }
 
 impl Default for CliffordFrame {
@@ -355,14 +359,14 @@ impl CliffordFrame {
         }
     }
 
-    fn default_x(q: ArchitectureQubit) -> PauliAxis {
+    fn default_x(q: ArchitectureQubit) -> PauliAxis<ArchitectureQubit> {
         PauliAxis {
             sign: Sign::One,
             pauli_string: PauliString::new(vec![(q, Pauli::X)]),
         }
     }
 
-    fn default_z(q: ArchitectureQubit) -> PauliAxis {
+    fn default_z(q: ArchitectureQubit) -> PauliAxis<ArchitectureQubit> {
         PauliAxis {
             sign: Sign::One,
             pauli_string: PauliString::new(vec![(q, Pauli::Z)]),
@@ -370,7 +374,7 @@ impl CliffordFrame {
     }
 
     /// Returns the image of basis element `p` on qubit `q` under the frame.
-    pub fn image(&self, q: ArchitectureQubit, p: Pauli) -> PauliAxis {
+    pub fn image(&self, q: ArchitectureQubit, p: Pauli) -> PauliAxis<ArchitectureQubit> {
         match p {
             Pauli::X => self
                 .x
@@ -400,7 +404,7 @@ impl CliffordFrame {
     }
 
     /// Conjugates `axis` by the frame: replaces each (q, p) factor with its frame image.
-    pub fn apply(&self, axis: &PauliAxis) -> PauliAxis {
+    pub fn apply(&self, axis: &PauliAxis<ArchitectureQubit>) -> PauliAxis<ArchitectureQubit> {
         let mut acc = PauliAxis {
             sign: axis.sign,
             pauli_string: PauliString::new(vec![]),
@@ -419,7 +423,7 @@ impl CliffordFrame {
     /// Updates the frame by composing a PiOver4 rotation about `rotation` on the left.
     /// Also initializes frame entries for qubits in `rotation` whose default basis
     /// element anti-commutes with the rotation.
-    pub fn update(&mut self, rotation: &PauliAxis) {
+    pub fn update(&mut self, rotation: &PauliAxis<ArchitectureQubit>) {
         let rot_qubits: Vec<_> = rotation.pauli_string.iter().map(|&(q, _)| q).collect();
 
         let x_qubits: Vec<_> = self

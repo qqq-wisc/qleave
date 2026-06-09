@@ -4,4 +4,7 @@ pub mod compile;
 pub mod parse;
 pub mod pbc;
 pub mod sat_partition;
+pub mod graph_construction;
+pub mod graph_to_checks;
+pub mod code_to_log_ops;
 // pub mod mip_partition;

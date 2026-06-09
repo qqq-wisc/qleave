@@ -236,7 +236,7 @@ fn gate_to_pbc_instructions(
                     },
                     id: m0,
                 },
-                // S correction on q conditioned on m0.
+                // Sdg correction on q conditioned on m0.
                 PauliProductOperation::ConditionalRotation {
                     axis: PauliAxis {
                         sign: NegOne,
@@ -1016,25 +1016,25 @@ mod tests {
         assert_eq!(sat_count, 6, "expected optimal 4 loads + 2 stores = 6");
     }
 
-    fn single(sign: Sign, q: ArchitectureQubit, p: Pauli) -> PauliAxis {
+    fn single(sign: Sign, q: ArchitectureQubit, p: Pauli) -> PauliAxis<ArchitectureQubit> {
         PauliAxis {
             sign,
             pauli_string: PauliString::new(vec![(q, p)]),
         }
     }
 
-    fn rot(axis: PauliAxis, angle: PPRAngle) -> PauliProductOperation {
+    fn rot(axis: PauliAxis<ArchitectureQubit>, angle: PPRAngle) -> PauliProductOperation {
         PauliProductOperation::Rotation { axis, angle }
     }
 
-    fn meas(axis: PauliAxis, id: u32) -> PauliProductOperation {
+    fn meas(axis: PauliAxis<ArchitectureQubit>, id: u32) -> PauliProductOperation {
         PauliProductOperation::Measurement {
             axis,
             id: MeasId(id),
         }
     }
 
-    fn absorbed_meas(instrs: Vec<PauliProductOperation>) -> PauliAxis {
+    fn absorbed_meas(instrs: Vec<PauliProductOperation>) -> PauliAxis<ArchitectureQubit> {
         let mut circ = PauliProductCircuit::new();
         circ.instructions = instrs;
         let out = absorb_cliffords(&circ);
@@ -1049,7 +1049,7 @@ mod tests {
         }
     }
 
-    fn absorbed_meas_vec(instrs: Vec<PauliProductOperation>) -> Vec<PauliAxis> {
+    fn absorbed_meas_vec(instrs: Vec<PauliProductOperation>) -> Vec<PauliAxis<ArchitectureQubit>> {
         let mut circ = PauliProductCircuit::new();
         circ.instructions = instrs;
         let out = absorb_cliffords(&circ);
