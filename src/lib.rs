@@ -6,5 +6,6 @@ pub mod pbc;
 pub mod sat_partition;
 pub mod graph_construction;
 pub mod graph_to_checks;
-pub mod code_to_log_ops;
+pub mod circuit_to_checks;
+pub mod checks_to_physical_circuit;
 // pub mod mip_partition;

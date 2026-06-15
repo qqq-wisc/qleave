@@ -1,15 +1,11 @@
-use crate::pbc::{Pauli, PauliString, PauliStringIndex};
+use crate::pbc::{CodeQubit, Pauli, PhysicalPauliString, PhysicalQubit};
 use petgraph::graph::{NodeIndex, UnGraph};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-type PhysicalPauliString = PauliString<PhysicalQubit>;
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct PhysicalQubit(pub usize);
-impl PauliStringIndex for PhysicalQubit {}
 fn paulis_commute(p: Pauli, q: Pauli) -> bool {
     p == Pauli::I || q == Pauli::I || p == q
 }
@@ -17,9 +13,13 @@ fn paulis_commute(p: Pauli, q: Pauli) -> bool {
 /// A measurement (surgery) graph together with its *ports* — the graph vertices
 /// the logical operator's support maps to under the port function `f: L → P`.
 /// Bridges (Lemma 25 of arXiv:2503.10390) attach to these ports.
-pub struct SurgeryGraph {
-    pub graph: UnGraph<(), ()>,
-    pub ports: Vec<NodeIndex>,
+pub struct SurgeryGraph<K> {
+    /// Node weights label the port vertices with their code qubit
+    /// (`Some(CodeQubit { block, index })`); all other vertices are `None`. Edges
+    /// (the ancilla / edge qubits) carry no weight. The ports — the graph vertices
+    /// the operator's support maps to — are exactly the `Some`-weighted vertices,
+    /// recovered grouped by block via [`SurgeryGraph::ports_by_block`].
+    pub graph: UnGraph<Option<CodeQubit<K>>, ()>,
     /// The cellulated cycle basis carried through from the congestion-aware
     /// expander: each entry is a face (cycle check / stabilizer) as the set of
     /// graph edges (vertex pairs, in `graph`'s vertex ids) bounding it. These are
@@ -35,27 +35,51 @@ pub struct SurgeryGraph {
     pub path_matching: Vec<Vec<Edge>>,
 }
 
-pub fn surgery_graph(
-    stabilizers: Vec<PhysicalPauliString>,
-    operator: PhysicalPauliString,
-) -> SurgeryGraph {
-    // Ports = the operator's support. Base vertex `i` keeps node id `i` through
-    // expander construction (node indices are preserved), thickening (level 0
-    // maps `v ↦ v`), and cellulation (only edges are added), so these ids remain
-    // valid ports in the final cellulated graph.
-    let ports: Vec<NodeIndex> = operator
-        .iter()
-        .filter(|(q, p)| *p != Pauli::I)
-        .map(|(q, p)| NodeIndex::new(q.0))
-        .collect();
+impl<K: Ord + Copy> SurgeryGraph<K> {
+    /// The ports — the graph vertices the operator's support maps to — grouped by
+    /// code block, recovered from the node weights (a port is a `Some`-weighted
+    /// vertex). Deterministic: a `BTreeMap` keyed by block, each block's vertices
+    /// in ascending node-id order, so [`bridge_surgery_graphs`] feeds a stable
+    /// order to `skiptree_labeling` (whose result depends on it).
+    pub fn ports_by_block(&self) -> BTreeMap<K, Vec<NodeIndex>> {
+        let mut ports: BTreeMap<K, Vec<NodeIndex>> = BTreeMap::new();
+        for v in self.graph.node_indices() {
+            if let Some(cq) = self.graph[v] {
+                ports.entry(cq.block).or_default().push(v);
+            }
+        }
+        ports
+    }
+}
+
+pub fn surgery_graph<K: Ord + Copy>(
+    stabilizers: &Vec<PhysicalPauliString>,
+    operator: &PhysicalPauliString,
+    block_name: K,
+) -> SurgeryGraph<K> {
     let (path_graph, path_matching) = path_matching_graph(&stabilizers, &operator);
     let expander =
         build_congestion_aware_expander(&path_graph, 100, &mut StdRng::seed_from_u64(42));
     let thickend = thicken(&expander);
     let cellulated = cellulate(&thickend, 4);
+    // The cellulated graph is unlabeled (`UnGraph<(), ()>`); lift it to carry node
+    // weights, then label each port vertex with its code qubit. The ports are the
+    // operator's support, vertices `0..|support|` in the order `path_matching_graph`
+    // created them: that position id is preserved through expander construction
+    // (node indices unchanged), thickening (level 0 maps `v ↦ v`), and cellulation
+    // (only vertices/edges added), so port position `p` is still vertex `p` here.
+    let mut graph: UnGraph<Option<CodeQubit<K>>, ()> =
+        cellulated.graph.map(|_, _| None, |_, _| ());
+    // Label port position `p` with the absolute within-block code-qubit index `q.0`
+    // — the absolute id lives only in the label, never as a structural vertex id.
+    for (p, (q, _)) in operator.iter().enumerate() {
+        graph[NodeIndex::new(p)] = Some(CodeQubit {
+            block: block_name,
+            index: q.0,
+        });
+    }
     SurgeryGraph {
-        graph: cellulated.graph,
-        ports,
+        graph,
         cycle_checks: cellulated.checks,
         path_matching,
     }
@@ -75,16 +99,19 @@ pub fn surgery_graph(
 /// of Ref. [71] (arXiv:2410.03628): the two port subgraphs are SkipTree-labeled
 /// and equal labels are matched (see [`skiptree_labeling`]), which keeps the new
 /// bridge cycles short (length ≤ max(γ, 8)) and low-congestion (ρ + 2).
-pub fn bridge_surgery_graphs(
-    left: &SurgeryGraph,
-    right: &SurgeryGraph,
+pub fn bridge_surgery_graphs<K: Ord + Copy + std::fmt::Debug>(
+    left: &SurgeryGraph<K>,
+    right: &SurgeryGraph<K>,
     distance: usize,
-) -> SurgeryGraph {
+) -> SurgeryGraph<K> {
     // Disjoint union: copy `left`, then append `right` with its ids shifted.
     let mut graph = left.graph.clone();
     let offset = left.graph.node_count();
-    for _ in 0..right.graph.node_count() {
-        graph.add_node(());
+    // Carry the right side's node weights across verbatim. `node_indices()` yields
+    // `0..count` in order, so the appended ids are exactly `offset + original`, and
+    // each port keeps its `CodeQubit { block, index }` — no relabeling needed.
+    for n in right.graph.node_indices() {
+        graph.add_node(right.graph[n].clone());
     }
     for e in right.graph.edge_indices() {
         let (a, b) = right.graph.edge_endpoints(e).expect("edge has endpoints");
@@ -95,9 +122,24 @@ pub fn bridge_surgery_graphs(
         );
     }
 
+    // The two graphs must use disjoint block keys (caller invariant) so the bridged
+    // graph's node weights still identify each code block unambiguously.
+    let left_blocks = left.ports_by_block();
+    let right_blocks = right.ports_by_block();
+    debug_assert!(
+        left_blocks.keys().all(|b| !right_blocks.contains_key(b)),
+        "bridge_surgery_graphs requires disjoint block keys; left={:?}, right={:?}",
+        left_blocks.keys().collect::<Vec<_>>(),
+        right_blocks.keys().collect::<Vec<_>>(),
+    );
+
     // SkipTree-label each side's port subgraph; the bridge matches equal labels.
-    let left_order = skiptree_labeling(&left.graph, &left.ports);
-    let right_order = skiptree_labeling(&right.graph, &right.ports);
+    // Ports are grouped by block, but the bridge labels them as one set, so
+    // flatten across blocks (deterministic: `ports_by_block` is a `BTreeMap`).
+    let left_ports: Vec<NodeIndex> = left_blocks.values().flatten().copied().collect();
+    let right_ports: Vec<NodeIndex> = right_blocks.values().flatten().copied().collect();
+    let left_order = skiptree_labeling(&left.graph, &left_ports);
+    let right_order = skiptree_labeling(&right.graph, &right_ports);
 
     // Bridge B: connect the port labeled `i` on the left to the port labeled `i`
     // on the right, for the first `d` labels (a matching: labels are distinct).
@@ -108,13 +150,9 @@ pub fn bridge_surgery_graphs(
         graph.add_edge(l, r, ());
     }
 
-    let mut ports = left.ports.clone();
-    ports.extend(
-        right
-            .ports
-            .iter()
-            .map(|p| NodeIndex::new(offset + p.index())),
-    );
+    // The bridged graph's ports (`P₁ ∪ P₂`) need no separate bookkeeping: the
+    // disjoint union already carried both sides' node weights across (left verbatim,
+    // right shifted by `offset`), so `ports_by_block` on the result recovers them.
 
     // Carry both sides' cellulated cycle checks through the disjoint union,
     // shifting the right side's vertex ids by `offset`. (The `d − 1` new cycles
@@ -139,7 +177,6 @@ pub fn bridge_surgery_graphs(
 
     SurgeryGraph {
         graph,
-        ports,
         cycle_checks,
         path_matching,
     }
@@ -175,7 +212,7 @@ fn skiptree_label_last(v: usize, children: &[Vec<usize>], label: &mut [usize], i
 /// Only the connected component of `ports[0]` in the induced subgraph is labeled
 /// — Lemma 10 assumes the port set induces a connected subgraph; if it does not,
 /// the bridge spans that component (and is correspondingly smaller).
-fn skiptree_labeling(graph: &UnGraph<(), ()>, ports: &[NodeIndex]) -> Vec<NodeIndex> {
+fn skiptree_labeling<N>(graph: &UnGraph<N, ()>, ports: &[NodeIndex]) -> Vec<NodeIndex> {
     let k = ports.len();
     if k == 0 {
         return Vec::new();
@@ -237,9 +274,21 @@ fn path_matching_graph(
 ) -> (UnGraph<(), ()>, Vec<Vec<Edge>>) {
     let mut g = UnGraph::new_undirected();
     let operator_physical_qubits: Vec<PhysicalQubit> = operator.iter().map(|(q, _)| *q).collect();
+    // One graph vertex per operator-support qubit, indexed by position (a dense
+    // `0..|support|`), not by the qubit's absolute id — the surgery ancilla scales
+    // with the operator's support weight, and `NodeIndex`es must be dense anyway.
+    // The absolute id `q.0` survives only as the port's `CodeQubit` label in
+    // `surgery_graph`; everything structural (graph ids, `Edge`s, `path_matching`)
+    // lives in this position space, so the `offset` shifts in `bridge_surgery_graphs`
+    // stay correct.
     let nodes: Vec<_> = operator_physical_qubits
         .iter()
         .map(|_| g.add_node(()))
+        .collect();
+    let position: BTreeMap<PhysicalQubit, usize> = operator_physical_qubits
+        .iter()
+        .enumerate()
+        .map(|(p, &q)| (q, p))
         .collect();
     let mut path_matching: Vec<Vec<Edge>> = Vec::with_capacity(stabilizers.len());
     for stab in stabilizers {
@@ -267,9 +316,9 @@ fn path_matching_graph(
         // Pair the (even number of) anticommuting positions into a path matching.
         let mut edges: Vec<Edge> = Vec::new();
         for pair in anticommuting_positions.chunks_exact(2) {
-            let (i, j) = (pair[0], pair[1]);
-            g.add_edge(nodes[i.0], nodes[j.0], ());
-            edges.push(canonical_edge(i.0, j.0));
+            let (i, j) = (position[&pair[0]], position[&pair[1]]);
+            g.add_edge(nodes[i], nodes[j], ());
+            edges.push(canonical_edge(i, j));
         }
         path_matching.push(edges);
     }
@@ -378,7 +427,7 @@ fn build_congestion_aware_expander(
 ) -> CongestionAwareExpander {
     let mut best: Option<CongestionAwareExpander> = None;
     for _ in 0..trials.max(1) {
-        let g = congestion_aware_expander(g0, 10, 100, 10, rng);
+        let g = congestion_aware_expander(g0, 2, 8, 5, rng);
         let smaller = best
             .as_ref()
             .is_none_or(|b| g.graph.edge_count() < b.graph.edge_count());
@@ -677,18 +726,20 @@ fn dl_bfs_path(
     None
 }
 
-/// A shortest simple cycle (as working-edge ids) through vertex `v`, which has
-/// degree ≥ 3. Self-loops are length-1 cycles; otherwise close each incident
-/// edge with a shortest path back to `v`.
+/// A shortest simple cycle (as working-edge ids) through vertex `v`, or `None` if
+/// `v` lies on no cycle (every incident edge is a bridge — possible even at degree
+/// ≥ 3, e.g. a cut vertex joined by bridges to otherwise-cyclic components).
+/// Self-loops are length-1 cycles; otherwise close each incident edge with a
+/// shortest path back to `v`.
 fn dl_shortest_cycle(
     wedges: &[Option<WorkingEdge>],
     incidence: &[Vec<usize>],
     v: usize,
-) -> Vec<usize> {
+) -> Option<Vec<usize>> {
     for &eid in &incidence[v] {
         let (a, b, _) = wedges[eid].as_ref().unwrap();
         if a == b {
-            return vec![eid];
+            return Some(vec![eid]);
         }
     }
     let mut best: Option<Vec<usize>> = None;
@@ -704,7 +755,7 @@ fn dl_shortest_cycle(
             }
         }
     }
-    best.expect("a min-degree-3 vertex lies on a cycle")
+    best
 }
 
 /// Freedman–Hastings Decongestion Lemma (Lemma A.0.2 of arXiv:2012.02249),
@@ -770,10 +821,14 @@ fn decongestion_cycle_basis(n: usize, edges: &[Edge], rng: &mut impl Rng) -> Vec
             continue;
         }
         // Case 3: min degree ≥ 3 — emit a short cycle, drop a random edge of it.
-        let v = (0..n)
-            .find(|&v| incidence[v].len() >= 3)
-            .expect("edges remain ⇒ some vertex has degree ≥ 3");
-        let cycle = dl_shortest_cycle(&wedges, &incidence, v);
+        // A min-degree-≥3 graph has a cycle, and every vertex on it has degree ≥ 3,
+        // so scanning the degree-≥3 vertices for the first that lies on a cycle
+        // always finds one (not every degree-≥3 vertex is on a cycle — a bridge-only
+        // cut vertex is not — so we cannot just take the first such vertex).
+        let cycle = (0..n)
+            .filter(|&v| incidence[v].len() >= 3)
+            .find_map(|v| dl_shortest_cycle(&wedges, &incidence, v))
+            .expect("edges remain at min degree ≥ 3 ⇒ the graph contains a cycle");
         let mut cycle_edges = Vec::new();
         for &eid in &cycle {
             cycle_edges.extend(wedges[eid].as_ref().unwrap().2.iter().copied());
@@ -1238,7 +1293,7 @@ fn laplacian_lambda2(g: &UnGraph<(), ()>) -> f64 {
 
 /// Compressed neighbor-index adjacency and per-vertex degrees, in the `0..n`
 /// index space used by the eigenvalue routines.
-fn laplacian_adjacency(g: &UnGraph<(), ()>, nodes: &[NodeIndex]) -> (Vec<Vec<usize>>, Vec<f64>) {
+fn laplacian_adjacency<N>(g: &UnGraph<N, ()>, nodes: &[NodeIndex]) -> (Vec<Vec<usize>>, Vec<f64>) {
     let pos: HashMap<NodeIndex, usize> = nodes.iter().enumerate().map(|(i, &v)| (v, i)).collect();
     let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
     for (i, &v) in nodes.iter().enumerate() {
@@ -1474,6 +1529,7 @@ fn symmetric_eigenvalues(mut a: Vec<f64>, n: usize) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pbc::PauliString;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
@@ -1482,6 +1538,24 @@ mod tests {
         let nodes: Vec<_> = (0..n).map(|_| g.add_node(())).collect();
         for &(i, j) in edges {
             g.add_edge(nodes[i], nodes[j], ());
+        }
+        g
+    }
+
+    /// `graph_from_edges` lifted to the labeled node-weight type a `SurgeryGraph`
+    /// carries, with `port_vertices` labeled as code qubits of `block` (each port's
+    /// own id used as its within-block index — the bridge tests don't read it). The
+    /// `Some`-weighted vertices are exactly what `ports_by_block` recovers as ports.
+    fn surgery_graph_with_ports(
+        n: usize,
+        edges: &[(usize, usize)],
+        block: &'static str,
+        port_vertices: &[usize],
+    ) -> UnGraph<Option<CodeQubit<&'static str>>, ()> {
+        let mut g: UnGraph<Option<CodeQubit<&'static str>>, ()> =
+            graph_from_edges(n, edges).map(|_, _| None, |_, _| ());
+        for &p in port_vertices {
+            g[NodeIndex::new(p)] = Some(CodeQubit { block, index: p });
         }
         g
     }
@@ -2077,7 +2151,7 @@ mod tests {
         !cycle.is_empty() && deg.values().all(|&d| d == 2)
     }
 
-    fn graph_is_connected(g: &UnGraph<(), ()>) -> bool {
+    fn graph_is_connected<N>(g: &UnGraph<N, ()>) -> bool {
         let nodes: Vec<NodeIndex> = g.node_indices().collect();
         if nodes.is_empty() {
             return true;
@@ -2163,7 +2237,7 @@ mod tests {
     // ----- Bridging (Lemma 25) ----------------------------------------------
 
     /// Cycle rank of a petgraph (|E| − |V| + #components).
-    fn graph_cycle_rank(g: &UnGraph<(), ()>) -> usize {
+    fn graph_cycle_rank<N>(g: &UnGraph<N, ()>) -> usize {
         let nodes: Vec<NodeIndex> = g.node_indices().collect();
         let (adj, _) = laplacian_adjacency(g, &nodes);
         g.edge_count() + connected_components(nodes.len(), &adj) - nodes.len()
@@ -2172,15 +2246,16 @@ mod tests {
     #[test]
     fn bridge_connects_ports_and_adds_expected_cycles() {
         // Two connected measurement graphs with designated ports.
+        // Disjoint block keys, per the bridge invariant.
         let s1 = SurgeryGraph {
-            graph: graph_from_edges(4, &[(0, 1), (1, 2), (2, 3), (3, 0)]), // 4-cycle
-            ports: vec![NodeIndex::new(0), NodeIndex::new(1), NodeIndex::new(2)],
+            // 4-cycle, ports {0, 1, 2}
+            graph: surgery_graph_with_ports(4, &[(0, 1), (1, 2), (2, 3), (3, 0)], "a", &[0, 1, 2]),
             cycle_checks: vec![],
             path_matching: vec![],
         };
         let s2 = SurgeryGraph {
-            graph: graph_from_edges(3, &[(0, 1), (1, 2), (2, 0)]), // triangle
-            ports: vec![NodeIndex::new(0), NodeIndex::new(1), NodeIndex::new(2)],
+            // triangle, ports {0, 1, 2}
+            graph: surgery_graph_with_ports(3, &[(0, 1), (1, 2), (2, 0)], "b", &[0, 1, 2]),
             cycle_checks: vec![],
             path_matching: vec![],
         };
@@ -2190,15 +2265,18 @@ mod tests {
         // Disjoint union plus exactly d bridge edges.
         assert_eq!(bridged.graph.node_count(), 4 + 3);
         assert_eq!(bridged.graph.edge_count(), 4 + 3 + d);
-        // Ports of the product operator are P₁ ∪ P₂.
-        assert_eq!(bridged.ports.len(), s1.ports.len() + s2.ports.len());
+        // Ports of the product operator are P₁ ∪ P₂ (counting port vertices).
+        let port_count = |s: &SurgeryGraph<&str>| s.ports_by_block().values().map(Vec::len).sum::<usize>();
+        assert_eq!(port_count(&bridged), port_count(&s1) + port_count(&s2));
 
         // Exactly d edges cross from the left side to the right side, and each
         // crossing edge joins a left port to a right port (a matching).
         let offset = 4;
         let mut crossings = 0;
-        let left_ports: HashSet<usize> = s1.ports.iter().map(|p| p.index()).collect();
-        let right_ports: HashSet<usize> = s2.ports.iter().map(|p| offset + p.index()).collect();
+        let left_ports: HashSet<usize> =
+            s1.ports_by_block().values().flatten().map(|p| p.index()).collect();
+        let right_ports: HashSet<usize> =
+            s2.ports_by_block().values().flatten().map(|p| offset + p.index()).collect();
         for e in bridged.graph.edge_indices() {
             let (a, b) = bridged.graph.edge_endpoints(e).unwrap();
             let (a, b) = (a.index(), b.index());
@@ -2218,14 +2296,13 @@ mod tests {
     #[test]
     fn bridge_caps_distance_at_available_ports() {
         let s1 = SurgeryGraph {
-            graph: graph_from_edges(3, &[(0, 1), (1, 2), (2, 0)]),
-            ports: vec![NodeIndex::new(0)], // only one port available
+            // only one port available
+            graph: surgery_graph_with_ports(3, &[(0, 1), (1, 2), (2, 0)], "a", &[0]),
             cycle_checks: vec![],
             path_matching: vec![],
         };
         let s2 = SurgeryGraph {
-            graph: graph_from_edges(3, &[(0, 1), (1, 2), (2, 0)]),
-            ports: vec![NodeIndex::new(0), NodeIndex::new(1)],
+            graph: surgery_graph_with_ports(3, &[(0, 1), (1, 2), (2, 0)], "b", &[0, 1]),
             cycle_checks: vec![],
             path_matching: vec![],
         };
@@ -2257,8 +2334,8 @@ mod tests {
             ps(vec![Pauli::I, Pauli::I, Pauli::Z, Pauli::Z]),
         ];
 
-        let s1 = surgery_graph(stabs1, op1);
-        let s2 = surgery_graph(stabs2, op2);
+        let s1 = surgery_graph(&stabs1, &op1, "left");
+        let s2 = surgery_graph(&stabs2, &op2, "right");
         let (n1, e1) = (s1.graph.node_count(), s1.graph.edge_count());
         let (n2, e2) = (s2.graph.node_count(), s2.graph.edge_count());
 
@@ -2266,12 +2343,15 @@ mod tests {
         let bridged = bridge_surgery_graphs(&s1, &s2, d);
 
         assert_eq!(bridged.graph.node_count(), n1 + n2);
-        assert_eq!(bridged.ports.len(), s1.ports.len() + s2.ports.len());
+        let port_count = |s: &SurgeryGraph<&str>| s.ports_by_block().values().map(Vec::len).sum::<usize>();
+        assert_eq!(port_count(&bridged), port_count(&s1) + port_count(&s2));
 
         // Count the actual bridge edges (crossing the disjoint-union boundary):
         // a matching of size ≤ d, each joining a left port to a right port.
-        let left_ports: HashSet<usize> = s1.ports.iter().map(|p| p.index()).collect();
-        let right_ports: HashSet<usize> = s2.ports.iter().map(|p| n1 + p.index()).collect();
+        let left_ports: HashSet<usize> =
+            s1.ports_by_block().values().flatten().map(|p| p.index()).collect();
+        let right_ports: HashSet<usize> =
+            s2.ports_by_block().values().flatten().map(|p| n1 + p.index()).collect();
         let mut bridge_edges = 0;
         let (mut used_left, mut used_right): (HashSet<usize>, HashSet<usize>) =
             (HashSet::new(), HashSet::new());

@@ -48,15 +48,6 @@ impl PauliProductCircuit {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Copy, PartialOrd, Ord, Debug)]
-pub enum ArchitectureQubit {
-    Memory(usize),
-    Processor(usize),
-    Magic(usize),
-}
-
-impl PauliStringIndex for ArchitectureQubit {}
-
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Hash)]
 pub enum Sign {
     One,
@@ -80,10 +71,21 @@ impl std::ops::Mul for Sign {
         }
     }
 }
-#[derive(Clone, Debug)]
+
+impl Default for Sign {
+    fn default() -> Self {
+        Sign::One
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct PauliString<A>(Vec<(A, Pauli)>);
 
 pub trait PauliStringIndex: Copy + std::cmp::Ord {}
+
+/// Flat integer qubit index, used by the stim-lowered physical circuit (see
+/// [`crate::checks_to_physical_circuit::PhysicalCircuit::flatten`]).
+impl PauliStringIndex for usize {}
 
 impl<A: PauliStringIndex> PauliString<A> {
     pub fn new(mut pairs: Vec<(A, Pauli)>) -> Self {
@@ -96,6 +98,15 @@ impl<A: PauliStringIndex> std::ops::Deref for PauliString<A> {
     type Target = [(A, Pauli)];
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl<A: PauliStringIndex> PauliString<A> {
+    /// Relabel every qubit index by `f`, keeping the Pauli at each site. The
+    /// result is re-sorted by [`PauliString::new`], so `f` need not be monotone.
+    /// Mirrors [`crate::circuit::shift_register`] for gates.
+    pub fn map_index<B: PauliStringIndex>(&self, mut f: impl FnMut(A) -> B) -> PauliString<B> {
+        PauliString::new(self.0.iter().map(|&(q, p)| (f(q), p)).collect())
     }
 }
 
@@ -194,6 +205,89 @@ pub struct PauliAxis<A> {
     pub sign: Sign,
     pub pauli_string: PauliString<A>,
 }
+
+impl<A: PauliStringIndex> PauliAxis<A> {
+    /// Relabel every qubit index by `f`, preserving the sign. See
+    /// [`PauliString::map_index`].
+    pub fn map_index<B: PauliStringIndex>(&self, f: impl FnMut(A) -> B) -> PauliAxis<B> {
+        PauliAxis {
+            sign: self.sign,
+            pauli_string: self.pauli_string.map_index(f),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Qubit index types
+//
+// The qubit identifiers a Pauli string can range over, in pipeline order: a
+// physical qubit of one block, a code qubit of a (bridged) merged code, and a
+// qubit of the surgery code built over a measurement graph. Each implements
+// [`PauliStringIndex`] so it can key a [`PauliString`] / [`PauliAxis`]; the
+// `…PauliString` / `…Pauli` aliases name the corresponding operator types.
+// ---------------------------------------------------------------------------
+
+/// A physical qubit of a single code block, identified by its within-block index.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct PhysicalQubit(pub usize);
+impl PauliStringIndex for PhysicalQubit {}
+
+/// A Pauli string over the physical qubits of one code block.
+pub type PhysicalPauliString = PauliString<PhysicalQubit>;
+
+/// A code qubit of a (possibly bridged) merged code: a within-block physical qubit
+/// `index` together with the `block` it belongs to. Carried as the surgery graph's
+/// node weight on the port vertices — `Some(CodeQubit { .. })` on a port, `None`
+/// on every other (ancilla / check) vertex. Recording the (block, index) pairing
+/// at construction means bridging carries it verbatim, so downstream code never
+/// has to undo the vertex-id offset a bridge introduces.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct CodeQubit<K> {
+    pub block: K,
+    pub index: usize,
+}
+impl<K: Ord + Copy> PauliStringIndex for CodeQubit<K> {}
+
+/// A Pauli operator over a single (possibly bridged) code's code qubits.
+pub type CodePauli<K> = PauliAxis<CodeQubit<K>>;
+
+/// A qubit of the merged surgery code: either an `EdgeQubit` (ancilla / edge
+/// qubit, keyed by edge id) or an original `CodeQubit` of a code block.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum MergedCodeQubit<K> {
+    EdgeQubit(usize),
+    CodeQubit { block: K, index: usize },
+}
+impl<K: Ord + Copy> PauliStringIndex for MergedCodeQubit<K> {}
+
+impl<K> From<CodeQubit<K>> for MergedCodeQubit<K> {
+    fn from(q: CodeQubit<K>) -> Self {
+        MergedCodeQubit::CodeQubit {
+            block: q.block,
+            index: q.index,
+        }
+    }
+}
+
+/// Lift a single code's Pauli operator into the merged surgery code by tagging
+/// each `CodeQubit` as a `MergedCodeQubit::CodeQubit`.
+pub fn lift_code_to_merged<K: Ord + Copy>(code_pauli: &CodePauli<K>) -> GraphPauli<K> {
+    code_pauli.map_index(MergedCodeQubit::from)
+}
+
+/// A Pauli operator over the merged surgery code's qubits.
+pub type GraphPauli<K> = PauliAxis<MergedCodeQubit<K>>;
+
+/// A *logical* qubit of the target architecture, tagged by the region it lives in
+/// (the memory / processor / magic-state blocks). The index type final compiled
+/// Pauli-product operations range over.
+#[derive(Clone, PartialEq, Eq, Hash, Copy, PartialOrd, Ord, Debug)]
+pub enum ArchitectureQubit {
+    Memory(usize),
+    Processor(usize),
+    Magic(usize),
+}
+impl PauliStringIndex for ArchitectureQubit {}
 #[derive(Clone, Debug)]
 pub enum PauliProductOperation {
     Rotation {
@@ -259,6 +353,15 @@ impl fmt::Display for ArchitectureQubit {
             ArchitectureQubit::Memory(n) => write!(f, "Mem{n}"),
             ArchitectureQubit::Processor(n) => write!(f, "Proc{n}"),
             ArchitectureQubit::Magic(n) => write!(f, "Magic{n}"),
+        }
+    }
+}
+
+impl<K: fmt::Display> fmt::Display for MergedCodeQubit<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MergedCodeQubit::EdgeQubit(n) => write!(f, "Edge{n}"),
+            MergedCodeQubit::CodeQubit { block, index } => write!(f, "{block}{index}"),
         }
     }
 }

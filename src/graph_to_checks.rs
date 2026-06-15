@@ -1,19 +1,10 @@
-use petgraph::graph::NodeIndex;
+use petgraph::algo::astar;
+use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::visit::EdgeRef;
 
-use crate::graph_construction::{Edge, PhysicalQubit, SurgeryGraph};
-use crate::pbc::{Pauli, PauliAxis, PauliString, PauliStringIndex, Sign};
+use crate::graph_construction::{Edge, SurgeryGraph};
+use crate::pbc::{CodePauli, GraphPauli, MergedCodeQubit, Pauli, PauliString, Sign, lift_code_to_merged};
 
-
-type Stabilizer = PauliAxis<MergedCodeQubit>;
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum MergedCodeQubit{
-    EdgeQubit(usize),
-    CodeQubit(PhysicalQubit),
-}
-impl PauliStringIndex for MergedCodeQubit {
-
-}
 
 /// Build the merged-code stabilizers `𝒬̄` of Definition 2 (arXiv:2503.10390)
 /// from a surgery graph, the original code stabilizers, and the logical operator
@@ -35,43 +26,50 @@ impl PauliStringIndex for MergedCodeQubit {
 /// `code_stabilizers` must be in the same order as the `stabilizers` passed to
 /// [`crate::graph_construction::surgery_graph`], so that `code_stabilizers[i]`
 /// pairs with `graph.path_matching[i]`.
-fn graph_to_checks(
-    graph: &SurgeryGraph,
-    code_stabilizers: &Vec<Stabilizer>,
-    operator: PauliString<PhysicalQubit>,
-) -> Vec<Stabilizer> {
+pub fn graph_to_checks<K : Ord + Copy>(
+    graph: &SurgeryGraph<K>,
+    code_stabilizers: &Vec<CodePauli<K>>,
+    operator: &CodePauli<K>
+) -> Vec<GraphPauli<K>> {
     let g = &graph.graph;
-    let p = &graph.ports;
 
     // Resolve a graph edge (vertex pair) to its merged-code edge qubit.
-    let edge_qubit = |(a, b): Edge| -> MergedCodeQubit {
+    let edge_qubit = |(a, b): Edge| -> MergedCodeQubit<K> {
         let e = g
             .find_edge(NodeIndex::new(a), NodeIndex::new(b))
             .expect("threaded edge must exist in the surgery graph");
         MergedCodeQubit::EdgeQubit(e.index())
     };
 
-    let mut joint_stabilizers: Vec<Stabilizer> = Vec::new();
+    let mut joint_stabilizers: Vec<GraphPauli<K>> = Vec::new();
 
     // (1) Vertex checks: Z on every incident edge, plus ℒ_q on the code qubit at
     // a port.
     for v in g.node_indices() {
-        let mut pairs: Vec<(MergedCodeQubit, Pauli)> = g
+        let mut pairs: Vec<(MergedCodeQubit<K>, Pauli)> = g
             .edges(v)
             .map(|e| (MergedCodeQubit::EdgeQubit(e.id().index()), Pauli::Z))
             .collect();
-        if p.contains(&v) {
-            // Port vertex f(q): node id is the physical qubit index q.0.
-            let phys_qubit = PhysicalQubit(v.index());
+        // Port vertex f(q): the node weight carries its code qubit (block, index).
+        // The within-block physical qubit index is `cq.index` — recorded at
+        // construction and preserved through bridging, so no offset math here.
+        if let Some(cq) = g[v] {
             let pauli_on_qubit = operator
+                .pauli_string
                 .iter()
-                .find(|&&(q, _)| q == phys_qubit)
+                .find(|&&(q, _)| q == cq)
                 .map(|&(_, p)| p)
                 .unwrap_or(Pauli::I);
-            pairs.push((MergedCodeQubit::CodeQubit(phys_qubit), pauli_on_qubit));
+            pairs.push((
+                MergedCodeQubit::CodeQubit {
+                    block: cq.block,
+                    index: cq.index,
+                },
+                pauli_on_qubit,
+            ));
         }
         let pauli_string = PauliString::new(pairs);
-        joint_stabilizers.push(Stabilizer {
+        joint_stabilizers.push(GraphPauli {
             sign: Sign::One,
             pauli_string,
         });
@@ -85,7 +83,7 @@ fn graph_to_checks(
                 .map(|&e| (edge_qubit(e), Pauli::X))
                 .collect::<Vec<_>>(),
         );
-        joint_stabilizers.push(Stabilizer {
+        joint_stabilizers.push(GraphPauli {
             sign: Sign::One,
             pauli_string,
         });
@@ -96,12 +94,12 @@ fn graph_to_checks(
     for (i, stab) in code_stabilizers.iter().enumerate() {
         let path_edges = graph.path_matching.get(i).map_or(&[][..], Vec::as_slice);
         if path_edges.is_empty() {
-            joint_stabilizers.push(stab.clone());
+            joint_stabilizers.push(lift_code_to_merged(stab));
             continue;
         }
-        let mut pairs: Vec<(MergedCodeQubit, Pauli)> = stab.pauli_string.iter().copied().collect();
+        let mut pairs: Vec<(MergedCodeQubit<K>, Pauli)> = lift_code_to_merged(stab).pauli_string.iter().copied().collect();
         pairs.extend(path_edges.iter().map(|&e| (edge_qubit(e), Pauli::X)));
-        joint_stabilizers.push(Stabilizer {
+        joint_stabilizers.push(GraphPauli {
             sign: stab.sign,
             pauli_string: PauliString::new(pairs),
         });
@@ -110,14 +108,64 @@ fn graph_to_checks(
     joint_stabilizers
 }
 
+pub struct CorrectionSupport<K>{pub qubit : MergedCodeQubit<K>, pub path : Vec<MergedCodeQubit<K>>}
+
+/// BFS shortest path from `source` to node 0 in `graph`, returned as the
+/// sequence of edge qubits traversed (empty if `source` is node 0).
+fn edge_path_to_root<K>(
+    graph: &UnGraph<Option<crate::pbc::CodeQubit<K>>, ()>,
+    source: NodeIndex,
+) -> Vec<MergedCodeQubit<K>> {
+    let target = NodeIndex::new(0);
+
+    // Unweighted shortest path (unit edge costs, zero heuristic ⇒ BFS-equivalent).
+    let (_, nodes) = astar(graph, source, |n| n == target, |_| 1, |_| 0)
+        .expect("surgery graph must be connected");
+
+    // Convert the node path source → root into its traversed edge qubits.
+    nodes
+        .windows(2)
+        .map(|pair| {
+            let edge = graph
+                .find_edge(pair[0], pair[1])
+                .expect("consecutive path nodes must be adjacent");
+            MergedCodeQubit::EdgeQubit(edge.index())
+        })
+        .collect()
+}
+
+pub fn get_correction_support<K : Ord + Copy>(graph: &SurgeryGraph<K>, operator: &CodePauli<K>) -> Vec<CorrectionSupport<K>> {
+    operator
+        .pauli_string
+        .iter()
+        .map(|(qubit, _)| {
+            // Ports are labeled with their absolute within-block qubit id `index`,
+            // but `ports_by_block()` lists them by *port position*, not by that id —
+            // so find the port whose label matches this qubit rather than indexing
+            // by `qubit.index` (which ranges over all of the block's qubits).
+            let ports = graph.ports_by_block();
+            let vertex = *ports
+                .get(&qubit.block)
+                .expect("should be a port")
+                .iter()
+                .find(|&&v| graph.graph[v] == Some(*qubit))
+                .expect("operator qubit must label a port");
+            let path = edge_path_to_root(&graph.graph, vertex);
+            CorrectionSupport { qubit: MergedCodeQubit::from(*qubit), path }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph_construction::surgery_graph;
-    use crate::pbc::{axes_commute, pauli_string_mult};
+    use crate::pbc::{
+        CodeQubit, PauliAxis, PhysicalPauliString, PhysicalQubit, axes_commute, pauli_string_mult,
+    };
 
     /// A logical operator / stabilizer over the original code qubits 0..n.
-    fn physical(paulis: &[Pauli]) -> PauliString<PhysicalQubit> {
+    fn physical(paulis: &[Pauli]) -> PhysicalPauliString {
         PauliString::new(
             paulis
                 .iter()
@@ -128,16 +176,27 @@ mod tests {
         )
     }
 
+    /// The block key for the single-block sample code.
+    const BLOCK: &str = "test";
+
     /// The same stabilizer expressed over the merged code's code qubits.
-    fn code_stabilizer(paulis: &[Pauli]) -> Stabilizer {
-        Stabilizer {
+    fn code_pauli(paulis: &[Pauli]) -> CodePauli<&'static str> {
+        CodePauli {
             sign: Sign::One,
             pauli_string: PauliString::new(
                 paulis
                     .iter()
                     .enumerate()
                     .filter(|&(_, &p)| p != Pauli::I)
-                    .map(|(i, &p)| (MergedCodeQubit::CodeQubit(PhysicalQubit(i)), p))
+                    .map(|(i, &p)| {
+                        (
+                            CodeQubit {
+                                block: BLOCK,
+                                index: i,
+                            },
+                            p,
+                        )
+                    })
                     .collect(),
             ),
         }
@@ -146,22 +205,26 @@ mod tests {
     /// A small merged code: measure XXXX against the two-stabilizer code
     /// {ZZII, IIZZ}. Both stabilizers anticommute with the operator (on {0,1}
     /// and {2,3}), so both gain path-matching edges.
-    fn sample() -> (SurgeryGraph, Vec<Stabilizer>, PauliString<PhysicalQubit>) {
-        let operator = physical(&[Pauli::X, Pauli::X, Pauli::X, Pauli::X]);
+    fn sample() -> (
+        SurgeryGraph<&'static str>,
+        Vec<CodePauli<&'static str>>,
+        CodePauli<&'static str>,
+    ) {
+        let operator = code_pauli(&[Pauli::X, Pauli::X, Pauli::X, Pauli::X]);
         let stab_paulis = [
             [Pauli::Z, Pauli::Z, Pauli::I, Pauli::I],
             [Pauli::I, Pauli::I, Pauli::Z, Pauli::Z],
         ];
         let stabs: Vec<_> = stab_paulis.iter().map(|s| physical(s)).collect();
-        let code_stabilizers: Vec<_> = stab_paulis.iter().map(|s| code_stabilizer(s)).collect();
-        let graph = surgery_graph(stabs, physical(&[Pauli::X, Pauli::X, Pauli::X, Pauli::X]));
+        let code_stabilizers: Vec<_> = stab_paulis.iter().map(|s| code_pauli(s)).collect();
+        let graph = surgery_graph(&stabs, &physical(&[Pauli::X, Pauli::X, Pauli::X, Pauli::X]), BLOCK);
         (graph, code_stabilizers, operator)
     }
 
     #[test]
     fn all_checks_pairwise_commute() {
         let (graph, code_stabilizers, operator) = sample();
-        let checks = graph_to_checks(&graph, &code_stabilizers, operator);
+        let checks = graph_to_checks(&graph, &code_stabilizers, &operator);
         // A valid stabilizer group: every pair of checks must commute.
         for (i, a) in checks.iter().enumerate() {
             for b in &checks[i + 1..] {
@@ -179,7 +242,7 @@ mod tests {
         let (graph, code_stabilizers, operator) = sample();
         // Vertex checks are emitted first, one per graph vertex.
         let num_vertices = graph.graph.node_count();
-        let checks = graph_to_checks(&graph, &code_stabilizers, operator.clone());
+        let checks = graph_to_checks(&graph, &code_stabilizers, &operator);
 
         // ∏_v A_v: every edge qubit appears in exactly two vertex checks (its two
         // endpoints), so all Z(e) cancel, leaving only the ℒ components on the
@@ -196,11 +259,20 @@ mod tests {
             };
         }
 
-        let expected: Vec<(MergedCodeQubit, Pauli)> = operator
+        let expected: Vec<(MergedCodeQubit<&str>, Pauli)> = operator
+            .pauli_string
             .iter()
-            .map(|&(q, p)| (MergedCodeQubit::CodeQubit(q), p))
+            .map(|&(q, p)| {
+                (
+                    MergedCodeQubit::CodeQubit {
+                        block: q.block,
+                        index: q.index,
+                    },
+                    p,
+                )
+            })
             .collect();
-        let got: Vec<(MergedCodeQubit, Pauli)> = product.pauli_string.iter().copied().collect();
+        let got: Vec<(MergedCodeQubit<&str>, Pauli)> = product.pauli_string.iter().copied().collect();
         assert_eq!(product.sign, Sign::One);
         assert_eq!(got, expected);
     }

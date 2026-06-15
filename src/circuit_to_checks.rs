@@ -1,0 +1,645 @@
+use crate::{
+    graph_construction::{bridge_surgery_graphs, surgery_graph},
+    graph_to_checks::{CorrectionSupport, get_correction_support, graph_to_checks},
+    pbc::{
+        ArchitectureQubit::{Magic, Memory, Processor}, CodePauli, CodeQubit, GraphPauli, Pauli, PauliAxis, PauliProductCircuit, PauliProductOperation, PauliString, PhysicalPauliString, PhysicalQubit, Sign, lift_code_to_merged, pauli_string_mult
+    },
+};
+use ndarray;
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
+
+pub struct DeformedCheckSequence{
+    pub base_checks : Vec<GraphPauli<BlockKind>>,
+    pub deformations : Vec<(Vec<GraphPauli<BlockKind>>, Vec<CorrectionSupport<BlockKind>>)>,
+}
+
+/// Lower a Pauli-product measurement circuit to its deformed stabilizer-check
+/// sequence. Pure: all qldpc-derived data is precomputed in `codes` (see
+/// [`CodeData::from_blocks`]), so this step shells out to nothing and never fails.
+
+
+pub fn physical_supports_to_stabilizer_checks(supports: &[PhysicalSupport], codes: &CodeData, distance: usize) -> DeformedCheckSequence{
+    let lift_stabilizers = |block: &BlockData, kind| {
+        block
+            .stabilizers
+            .iter()
+            .map(move |x| lift_physical_to_merged(x, kind))
+            .collect::<Vec<_>>()
+    };
+    let base_checks = [
+        lift_stabilizers(&codes.processor, BlockKind::Processor),
+        lift_stabilizers(&codes.memory, BlockKind::Memory),
+        lift_stabilizers(&codes.magic, BlockKind::Magic),
+    ]
+    .concat();
+    let deformations = physical_supports_to_stabilizer_sets(codes, distance, &supports);
+    DeformedCheckSequence { base_checks, deformations }
+}
+
+
+
+/// The qldpc helper script (see its header for the wire protocol), compiled in so
+/// the binary carries it and needs no helper file on disk at runtime.
+const LOGICAL_BASIS_PY: &str = include_str!("get_logical_basis.py");
+
+/// Compute a basis of nontrivial logical Pauli operators for the CSS code with
+/// X/Z parity checks `h_x`/`h_z`, by delegating to qldpc: `CSSCode.reduce_logical_ops`
+/// with BP+OSD, then `get_logical_ops`.
+///
+/// qldpc returns a `(2k, 2n)` GF(2) matrix — columns `0..n` are X-type support,
+/// `n..2n` Z-type — whose rows we fold into one [`PhysicalPauliString`] each
+/// (`X`/`Z`/`Y`/`I` per qubit). The interpreter is taken from `$QLDPC_PYTHON`
+/// (default `python3`); that environment must have `qldpc` installed.
+fn get_logical_basis(block: &CSSCodeBlock) -> io::Result<Vec<PhysicalPauliString>> {
+    let CSSCodeBlock { hx, hz } = block;
+    debug_assert_eq!(
+        hx.ncols(),
+        hz.ncols(),
+        "hx and hz must act on the same number of physical qubits",
+    );
+
+    let stdout = run_qldpc_helper(LOGICAL_BASIS_PY, |w| {
+        write_matrix(&mut *w, hx.view())?;
+        write_matrix(&mut *w, hz.view())
+    })?;
+    parse_logical_ops(&stdout)
+}
+
+/// The qldpc helper script that builds a named code block's parity-check matrices
+/// (see its header for the wire protocol), compiled in alongside the binary.
+const CSS_CODE_PY: &str = include_str!("get_css_code.py");
+
+/// Build the [`CSSCodeBlock`] for a named code from the architecture's paper
+/// (e.g. `"bb18"`, `"lp3_5_20"`, `"lp3_7_20"`, `"lp3_7_24"`) by delegating its
+/// `h_x`/`h_z` construction to qldpc; see `get_css_code.py` for the supported
+/// names and wire protocol. The interpreter is taken from `$QLDPC_PYTHON`
+/// (default `python3`); that environment must have `qldpc` installed.
+pub fn css_block(name: &str) -> io::Result<CSSCodeBlock> {
+    let stdout = run_qldpc_helper(CSS_CODE_PY, |w| w.write_all(name.as_bytes()))?;
+    let mut tokens = Tokens::new(&stdout)?;
+    let hx = tokens.read_matrix()?;
+    let hz = tokens.read_matrix()?;
+    if hx.ncols() != hz.ncols() {
+        return Err(io::Error::other(format!(
+            "code `{name}`: h_x has {} columns but h_z has {}",
+            hx.ncols(),
+            hz.ncols(),
+        )));
+    }
+    Ok(CSSCodeBlock { hx, hz })
+}
+
+/// Spawn the qldpc Python helper `script` (run as `python -c <script>`), feed it
+/// the bytes written by `write_input` on stdin, and return its stdout. The
+/// interpreter is `$QLDPC_PYTHON` (default `python3`); that environment must have
+/// `qldpc` installed.
+fn run_qldpc_helper(
+    script: &str,
+    write_input: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+) -> io::Result<Vec<u8>> {
+    let python = std::env::var("QLDPC_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let mut child = Command::new(&python)
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| io::Error::new(e.kind(), format!("failed to launch `{python}`: {e}")))?;
+
+    // The helper reads stdin to EOF before emitting anything, so writing the full
+    // input and dropping stdin before reading stdout cannot deadlock.
+    {
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let mut w = io::BufWriter::new(stdin);
+        write_input(&mut w)?;
+        w.flush()?;
+    }
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "qldpc helper (`{python}`) failed ({}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )));
+    }
+    Ok(output.stdout)
+}
+
+/// Write a boolean matrix in the helper's wire format: a `rows cols` header line
+/// followed by the row-major `0`/`1` entries.
+fn write_matrix(w: &mut dyn Write, m: ndarray::ArrayView2<bool>) -> io::Result<()> {
+    writeln!(w, "{} {}", m.nrows(), m.ncols())?;
+    for i in 0..m.nrows() {
+        for j in 0..m.ncols() {
+            if j > 0 {
+                write!(w, " ")?;
+            }
+            write!(w, "{}", if m[[i, j]] { 1 } else { 0 })?;
+        }
+        writeln!(w)?;
+    }
+    Ok(())
+}
+
+/// A cursor over the whitespace-separated integer tokens of a helper's stdout,
+/// used to read back the `rows cols <bits>` matrices of the wire protocol.
+struct Tokens<'a> {
+    toks: Vec<&'a str>,
+    cur: usize,
+}
+
+impl<'a> Tokens<'a> {
+    fn new(stdout: &'a [u8]) -> io::Result<Self> {
+        let text = std::str::from_utf8(stdout)
+            .map_err(|e| io::Error::other(format!("helper stdout was not UTF-8: {e}")))?;
+        Ok(Self {
+            toks: text.split_whitespace().collect(),
+            cur: 0,
+        })
+    }
+
+    fn take(&mut self, what: &str) -> io::Result<usize> {
+        let s = self
+            .toks
+            .get(self.cur)
+            .ok_or_else(|| io::Error::other(format!("helper stdout ended while reading {what}")))?;
+        self.cur += 1;
+        s.parse::<usize>()
+            .map_err(|e| io::Error::other(format!("helper stdout: bad {what} `{s}`: {e}")))
+    }
+
+    /// Read one `rows cols` header followed by the row-major `0`/`1` entries.
+    fn read_matrix(&mut self) -> io::Result<ndarray::Array2<bool>> {
+        let rows = self.take("row count")?;
+        let cols = self.take("column count")?;
+        let mut m = ndarray::Array2::<bool>::default((rows, cols));
+        for i in 0..rows {
+            for j in 0..cols {
+                m[[i, j]] = self.take("matrix entry")? != 0;
+            }
+        }
+        Ok(m)
+    }
+}
+
+/// Parse the helper's `(2k, 2n)` logical-ops matrix into one Pauli string per row,
+/// reading qubit `q`'s X bit from column `q` and Z bit from column `n + q`.
+fn parse_logical_ops(stdout: &[u8]) -> io::Result<Vec<PhysicalPauliString>> {
+    let matrix = Tokens::new(stdout)?.read_matrix()?;
+    let cols = matrix.ncols();
+    if cols % 2 != 0 {
+        return Err(io::Error::other(format!(
+            "logical-ops matrix has odd width {cols}; expected 2n columns",
+        )));
+    }
+    let n = cols / 2;
+
+    let mut basis = Vec::with_capacity(matrix.nrows());
+    for row in matrix.rows() {
+        let mut pairs = Vec::new();
+        for q in 0..n {
+            let pauli = match (row[q], row[n + q]) {
+                (false, false) => continue,
+                (true, false) => Pauli::X,
+                (false, true) => Pauli::Z,
+                (true, true) => Pauli::Y,
+            };
+            pairs.push((PhysicalQubit(q), pauli));
+        }
+        basis.push(PhysicalPauliString::new(pairs));
+    }
+    Ok(basis)
+}
+
+fn get_stabilizers(
+    code_block: &CSSCodeBlock
+) -> Vec<PhysicalPauliString> {
+    let mut stabilizers = Vec::new();
+    for i in 0..code_block.hx.nrows() {
+        let mut pairs: Vec<(PhysicalQubit, Pauli)> = Vec::new();
+        for j in 0..code_block.hx.ncols() {
+            if code_block.hx[[i, j]] {
+                pairs.push((PhysicalQubit(j), Pauli::X));
+            }
+        }
+        stabilizers.push(PhysicalPauliString::new(pairs));
+    }
+    for i in 0..code_block.hz.nrows() {
+        let mut pairs: Vec<(PhysicalQubit, Pauli)> = Vec::new();
+        for j in 0..code_block.hz.ncols() {
+            if code_block.hz[[i, j]] {
+                pairs.push((PhysicalQubit(j), Pauli::Z));
+            }
+        }
+        stabilizers.push(PhysicalPauliString::new(pairs));
+    }
+    stabilizers
+}
+
+/// Identifies one of the architecture's code blocks. Used as the port-map key for
+/// [`SurgeryGraph`](crate::graph_construction::SurgeryGraph) (`Ord` for the
+/// `BTreeMap`; `Copy`/no allocation, unlike a `String` name).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum BlockKind {
+    Memory,
+    Processor,
+    Magic,
+}
+
+impl std::fmt::Display for BlockKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockKind::Memory => write!(f, "Mem"),
+            BlockKind::Processor => write!(f, "Proc"),
+            BlockKind::Magic => write!(f, "Magic"),
+        }
+    }
+}
+
+/// Which of the three blocks a measurement's support touches. A measurement is
+/// either confined to a single block (an in-block measurement, no bridge needed)
+/// or spans exactly two of the three blocks (bridged via lattice surgery). The
+/// two-block variants carry their supports in canonical memory < processor < magic
+/// order; the single-block variant carries its support and which block it is.
+enum BlockSupport<'a> {
+    Single(&'a PhysicalPauliString, BlockKind),
+    MemoryProcessor(&'a PhysicalPauliString, &'a PhysicalPauliString),
+    MemoryMagic(&'a PhysicalPauliString, &'a PhysicalPauliString),
+    ProcessorMagic(&'a PhysicalPauliString, &'a PhysicalPauliString),
+}
+
+pub struct PhysicalSupport {
+    sign: Sign,
+    memory: PhysicalPauliString,
+    processor: PhysicalPauliString,
+    magic: PhysicalPauliString,
+}
+
+impl PhysicalSupport {
+    fn new() -> Self {
+        Self {
+            sign: Sign::One,
+            memory: PhysicalPauliString::new(vec![]),
+            processor: PhysicalPauliString::new(vec![]),
+            magic: PhysicalPauliString::new(vec![]),
+        }
+    }
+
+    /// The blocks this support touches as a [`BlockSupport`], ready to match on
+    /// directly. A measurement is confined to one block or spans two of the three,
+    /// so at least one of `memory`/`processor`/`magic` is empty; panics on an empty
+    /// support (touches no block) or a support spanning all three blocks.
+    fn block_support(&self) -> BlockSupport<'_> {
+        match (
+            self.memory.is_empty(),
+            self.processor.is_empty(),
+            self.magic.is_empty(),
+        ) {
+            (false, true, true) => BlockSupport::Single(&self.memory, BlockKind::Memory),
+            (true, false, true) => BlockSupport::Single(&self.processor, BlockKind::Processor),
+            (true, true, false) => BlockSupport::Single(&self.magic, BlockKind::Magic),
+            (false, false, true) => BlockSupport::MemoryProcessor(&self.memory, &self.processor),
+            (false, true, false) => BlockSupport::MemoryMagic(&self.memory, &self.magic),
+            (true, false, false) => BlockSupport::ProcessorMagic(&self.processor, &self.magic),
+            (m, p, g) => panic!(
+                "support must touch one or two blocks; empty = \
+                 (memory: {m}, processor: {p}, magic: {g})",
+            ),
+        }
+    }
+}
+
+pub struct CSSCodeBlock {
+    hx: ndarray::Array2<bool>,
+    hz: ndarray::Array2<bool>,
+}
+
+/// The per-block code data the PPM lowering consumes.
+struct BlockData {
+    /// `(2k, 2n)` logical-operator basis — rows `0..k` logical-X, `k..2k` logical-Z
+    /// — in the layout [`logical_image`] indexes into. The qldpc `reduce_logical_ops`
+    /// result: the only field whose computation shells out to Python.
+    logical_basis: Vec<PhysicalPauliString>,
+    /// X/Z stabilizer generators read directly off `h_x` / `h_z`.
+    stabilizers: Vec<PhysicalPauliString>,
+}
+
+/// Everything derived from an architecture's three CSS code blocks, computed once.
+/// Separates the impure, qldpc-shelled setup ([`CodeData::from_blocks`]) from the
+/// pure lowering that consumes it ([`pauli_product_circuit_to_stabilizer_checks`]),
+/// so the latter is fast to call repeatedly and testable without a Python qldpc.
+pub struct CodeData {
+    memory: BlockData,
+    processor: BlockData,
+    magic: BlockData,
+}
+
+impl CodeData {
+    /// Compute each block's logical basis (via qldpc — the slow, fallible step) and
+    /// stabilizer generators. This is the only part of the PPM→checks path that
+    /// shells out to Python.
+    pub fn from_blocks(
+        memory: &CSSCodeBlock,
+        processor: &CSSCodeBlock,
+        magic: &CSSCodeBlock,
+    ) -> io::Result<CodeData> {
+        let block = |b: &CSSCodeBlock| -> io::Result<BlockData> {
+            Ok(BlockData {
+                logical_basis: get_logical_basis(b)?,
+                stabilizers: get_stabilizers(b),
+            })
+        };
+        Ok(CodeData {
+            memory: block(memory)?,
+            processor: block(processor)?,
+            magic: block(magic)?,
+        })
+    }
+}
+
+fn operation_to_physical_support(
+    op: &PauliProductOperation,
+    memory_ops: &[PhysicalPauliString],
+    processor_ops: &[PhysicalPauliString],
+    magic_ops: &[PhysicalPauliString],
+) -> PhysicalSupport {
+    let PauliProductOperation::Measurement { axis, .. } = op else {
+        unreachable!("Should only be applying this conversion to measurements");
+    };
+
+    let mut acc = PhysicalSupport::new();
+    for &(qubit, pauli) in axis.pauli_string.iter() {
+        // Route each physical factor to its block's logical basis and the matching
+        // accumulator field; the per-Pauli image is then computed identically.
+        let (ops, target, q) = match qubit {
+            Memory(q) => (&memory_ops, &mut acc.memory, q),
+            Processor(q) => (&processor_ops, &mut acc.processor, q),
+            Magic(q) => (&magic_ops, &mut acc.magic, q),
+        };
+        let image = logical_image(ops, q, pauli);
+        let prod = pauli_string_mult(&image.pauli_string, target);
+        acc.sign = acc.sign * image.sign * prod.sign;
+        *target = prod.pauli_string;
+    }
+    acc
+}
+
+pub fn pauli_product_circuit_to_physical_supports(
+    circuit: &PauliProductCircuit,
+    codes: &CodeData,
+) -> Vec<PhysicalSupport> {
+    circuit
+        .instructions
+        .iter()
+        .map(|op| {
+            operation_to_physical_support(
+                op,
+                &codes.memory.logical_basis,
+                &codes.processor.logical_basis,
+                &codes.magic.logical_basis,
+            )
+        })
+        .collect()
+}
+
+fn lift_physical_to_code(p: &PhysicalPauliString, block_kind: BlockKind) -> CodePauli<BlockKind> {
+    CodePauli {
+        sign: Sign::One,
+        pauli_string: PauliString::new(
+            p.iter()
+                .map(|&(PhysicalQubit(q), p)| {
+                    (
+                        CodeQubit {
+                            block: block_kind,
+                            index: q,
+                        },
+                        p,
+                    )
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn lift_physical_to_merged(p: &PhysicalPauliString, block_kind: BlockKind) -> GraphPauli<BlockKind> {
+    lift_code_to_merged(&lift_physical_to_code(p, block_kind))
+}
+
+/// One block of a two-block measurement: its code stabilizers, the support the
+/// measured operator restricts to on this block, and which block it is.
+struct BlockSurgery<'a> {
+    stabilizers: &'a Vec<PhysicalPauliString>,
+    support: &'a PhysicalPauliString,
+    kind: BlockKind,
+}
+
+/// Build the merged-code checks for a support spanning the two blocks `a` and `b`:
+/// bridge their surgery graphs, lift both blocks' stabilizers into the merged code
+/// (in bridge order — `a` first, then `b`, so they align with the bridged graph's
+/// `path_matching`), and join the two block supports into the measured operator.
+/// The third, uninvolved block is unaffected by the surgery, so its
+/// `static_stabilizers` are kept verbatim in the deformation's check set.
+fn bridged_checks(
+    a: BlockSurgery,
+    b: BlockSurgery,
+    static_stabilizers : Vec<GraphPauli<BlockKind>>,
+    sign: Sign,
+    distance: usize,
+) -> (Vec<GraphPauli<BlockKind>>, Vec<CorrectionSupport<BlockKind>>) {
+    let a_graph = surgery_graph(a.stabilizers, a.support, a.kind);
+    let b_graph = surgery_graph(b.stabilizers, b.support, b.kind);
+    let graph = bridge_surgery_graphs(&a_graph, &b_graph, distance);
+
+    let code_stabilizers: Vec<CodePauli<BlockKind>> = a
+        .stabilizers
+        .iter()
+        .map(|s| lift_physical_to_code(s, a.kind))
+        .chain(b.stabilizers.iter().map(|s| lift_physical_to_code(s, b.kind)))
+        .collect();
+
+    let a_operator = lift_physical_to_code(a.support, a.kind);
+    let b_operator = lift_physical_to_code(b.support, b.kind);
+    let operator = CodePauli {
+        sign,
+        pauli_string: PauliString::new(
+            a_operator
+                .pauli_string
+                .iter()
+                .chain(b_operator.pauli_string.iter())
+                .copied()
+                .collect(),
+        ),
+    };
+
+    let mut checks = graph_to_checks(&graph, &code_stabilizers, &operator);
+    checks.extend(static_stabilizers);
+    let support = get_correction_support(&graph, &operator);
+    (checks, support)
+}
+
+/// Build the merged-code checks for a support confined to the single block `b`: an
+/// in-block logical measurement needs no bridge, so we build that one block's
+/// surgery graph alone, lift its stabilizers and the measured operator into the
+/// merged code, and read off the checks. The other two blocks (uninvolved) pass
+/// through as static stabilizers.
+fn single_block_checks(
+    b: BlockSurgery,
+    static_stabilizers: Vec<GraphPauli<BlockKind>>,
+    sign: Sign,
+) -> (Vec<GraphPauli<BlockKind>>, Vec<CorrectionSupport<BlockKind>>) {
+    let graph = surgery_graph(b.stabilizers, b.support, b.kind);
+
+    let code_stabilizers: Vec<CodePauli<BlockKind>> = b
+        .stabilizers
+        .iter()
+        .map(|s| lift_physical_to_code(s, b.kind))
+        .collect();
+
+    let operator = CodePauli {
+        sign,
+        pauli_string: lift_physical_to_code(b.support, b.kind).pauli_string,
+    };
+
+    let mut checks = graph_to_checks(&graph, &code_stabilizers, &operator);
+    checks.extend(static_stabilizers);
+    let support = get_correction_support(&graph, &operator);
+    (checks, support)
+}
+
+fn physical_supports_to_stabilizer_sets(
+    codes: &CodeData,
+    distance: usize,
+    supports: &[PhysicalSupport],
+) -> Vec<(Vec<GraphPauli<BlockKind>>, Vec<CorrectionSupport<BlockKind>>)> {
+    let processor_stabilizers = &codes.processor.stabilizers;
+    let memory_stabilizers = &codes.memory.stabilizers;
+    let magic_stabilizers = &codes.magic.stabilizers;
+
+    let block = |stabilizers, support, kind| BlockSurgery {
+        stabilizers,
+        support,
+        kind,
+    };
+
+    // Lift the two blocks uninvolved in a single-block measurement into static
+    // merged stabilizers, picked by which block the measurement lives in.
+    let lift_static = |kinds: [BlockKind; 2]| -> Vec<GraphPauli<BlockKind>> {
+        kinds
+            .iter()
+            .flat_map(|&kind| {
+                let stabs = match kind {
+                    BlockKind::Memory => memory_stabilizers,
+                    BlockKind::Processor => processor_stabilizers,
+                    BlockKind::Magic => magic_stabilizers,
+                };
+                stabs.iter().map(move |s| lift_physical_to_merged(s, kind))
+            })
+            .collect()
+    };
+
+    let mut stabilizers = Vec::new();
+    for support in supports {
+        let checks = match support.block_support() {
+            BlockSupport::Single(support_ps, kind) => {
+                let (stabs, static_kinds) = match kind {
+                    BlockKind::Memory => (memory_stabilizers, [BlockKind::Processor, BlockKind::Magic]),
+                    BlockKind::Processor => (processor_stabilizers, [BlockKind::Memory, BlockKind::Magic]),
+                    BlockKind::Magic => (magic_stabilizers, [BlockKind::Memory, BlockKind::Processor]),
+                };
+                single_block_checks(
+                    block(stabs, support_ps, kind),
+                    lift_static(static_kinds),
+                    support.sign,
+                )
+            }
+            BlockSupport::MemoryProcessor(memory, processor) => bridged_checks(
+                block(memory_stabilizers, memory, BlockKind::Memory),
+                block(processor_stabilizers, processor, BlockKind::Processor),
+                magic_stabilizers.iter().map(|s| lift_physical_to_merged(s, BlockKind::Magic)).collect(),
+                support.sign,
+                distance,
+            ),
+            BlockSupport::MemoryMagic(memory, magic) => bridged_checks(
+                block(memory_stabilizers, memory, BlockKind::Memory),
+                block(magic_stabilizers, magic, BlockKind::Magic),
+                processor_stabilizers.iter().map(|s| lift_physical_to_merged(s, BlockKind::Processor)).collect(),
+                support.sign,
+                distance,
+            ),
+            BlockSupport::ProcessorMagic(processor, magic) => bridged_checks(
+                block(processor_stabilizers, processor, BlockKind::Processor),
+                block(magic_stabilizers, magic, BlockKind::Magic),
+                memory_stabilizers.iter().map(|s| lift_physical_to_merged(s, BlockKind::Memory)).collect(),
+                support.sign,
+                distance,
+            ),
+        };
+        stabilizers.push(checks);
+    }
+    stabilizers
+}
+
+/// The logical operator a physical Pauli `pauli` on logical qubit `q` maps to,
+/// read from a `(2k, 2n)` logical basis `ops` whose rows `0..k` are logical-X and
+/// `k..2k` logical-Z operators. `Y = iXZ`; identity maps to the empty string.
+fn logical_image(ops: &[PhysicalPauliString], q: usize, pauli: Pauli) -> PauliAxis<PhysicalQubit> {
+    let k = ops.len() / 2;
+    match pauli {
+        Pauli::I => PauliAxis {
+            sign: Sign::One,
+            pauli_string: PauliString::new(vec![]),
+        },
+        Pauli::X => PauliAxis {
+            sign: Sign::One,
+            pauli_string: ops[q].clone(),
+        },
+        Pauli::Z => PauliAxis {
+            sign: Sign::One,
+            pauli_string: ops[q + k].clone(),
+        },
+        Pauli::Y => {
+            let xz = pauli_string_mult(&ops[q], &ops[q + k]);
+            PauliAxis {
+                sign: xz.sign * Sign::J,
+                pauli_string: xz.pauli_string,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    /// End-to-end check against qldpc using the Steane `[[7, 1, 3]]` code, whose
+    /// X and Z checks are both the Hamming `[7, 4, 3]` parity matrix. Ignored by
+    /// default since it shells out to a Python interpreter with qldpc installed;
+    /// run with e.g. `QLDPC_PYTHON=/path/to/venv/bin/python cargo test -- --ignored`.
+    #[test]
+    #[ignore = "requires a Python interpreter with qldpc (set QLDPC_PYTHON)"]
+    fn steane_logical_basis() {
+        let h = array![
+            [false, false, false, true, true, true, true],
+            [false, true, true, false, false, true, true],
+            [true, false, true, false, true, false, true],
+        ];
+        let block = CSSCodeBlock {
+            hx: h.clone(),
+            hz: h,
+        };
+        let basis = get_logical_basis(&block).expect("qldpc helper succeeds");
+
+        // k = 1 logical qubit ⇒ one logical-X and one logical-Z operator.
+        assert_eq!(basis.len(), 2);
+        // The logical X is X-type (no Z/Y factors), the logical Z is Z-type.
+        assert!(basis[0].iter().all(|&(_, p)| p == Pauli::X));
+        assert!(basis[1].iter().all(|&(_, p)| p == Pauli::Z));
+        // Distance 3: each weight-3 representative is the minimum nontrivial weight.
+        assert_eq!(basis[0].len(), 3);
+        assert_eq!(basis[1].len(), 3);
+    }
+}

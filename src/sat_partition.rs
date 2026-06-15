@@ -227,7 +227,7 @@ pub fn optimize_partition(
     let deadline = timeout_secs.map(|s| Instant::now() + Duration::from_secs(s));
 
     loop {
-        println!("best_cost so far: {best_cost}");
+        eprintln!("best_cost so far: {best_cost}");
         if best_cost == 0 {
             break;
         }
@@ -281,11 +281,11 @@ pub fn optimize_partition(
                 best_cost = count;
             }
             SolverResult::Unsat => {
-                println!("Found optimal solution, with {best_cost} l/s ops");
+                eprintln!("Found optimal solution, with {best_cost} l/s ops");
                 break;
             }
             SolverResult::Interrupted => {
-                println!(
+                eprintln!(
                     "Solver interrupted, returning best solution found with {best_cost} l/s ops"
                 );
                 break;
