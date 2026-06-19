@@ -1,6 +1,6 @@
 use crate::{
     graph_construction::{bridge_surgery_graphs, surgery_graph},
-    graph_to_checks::{CorrectionSupport, get_correction_support, graph_to_checks},
+    graph_to_checks::{CorrectionSupport, get_correction_support, graph_to_checks, operator_edge_basis},
     pbc::{
         ArchitectureQubit::{Magic, Memory, Processor}, CodePauli, CodeQubit, GraphPauli, Pauli, PauliAxis, PauliProductCircuit, PauliProductOperation, PauliString, PhysicalPauliString, PhysicalQubit, Sign, lift_code_to_merged, pauli_string_mult
     },
@@ -9,9 +9,22 @@ use ndarray;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
+#[derive(Clone)]
 pub struct DeformedCheckSequence{
     pub base_checks : Vec<GraphPauli<BlockKind>>,
-    pub deformations : Vec<(Vec<GraphPauli<BlockKind>>, Vec<CorrectionSupport<BlockKind>>)>,
+    pub deformations : Vec<Deformation>,
+}
+
+/// One logical Pauli measurement lowered to merged-code checks: the deformed
+/// `checks`, the split-time `corrections`, and the `edge_basis` — the Pauli the
+/// vertex checks carry on edge qubits (the operator type; see
+/// [`operator_edge_basis`]). Downstream lowering needs `edge_basis` to tell
+/// vertex checks from cycle checks and to orient the byproduct.
+#[derive(Clone)]
+pub struct Deformation {
+    pub checks: Vec<GraphPauli<BlockKind>>,
+    pub corrections: Vec<CorrectionSupport<BlockKind>>,
+    pub edge_basis: Pauli,
 }
 
 /// Lower a Pauli-product measurement circuit to its deformed stabilizer-check
@@ -271,6 +284,7 @@ enum BlockSupport<'a> {
     ProcessorMagic(&'a PhysicalPauliString, &'a PhysicalPauliString),
 }
 
+#[derive(Debug, Clone)]
 pub struct PhysicalSupport {
     sign: Sign,
     memory: PhysicalPauliString,
@@ -332,8 +346,8 @@ struct BlockData {
 /// pure lowering that consumes it ([`pauli_product_circuit_to_stabilizer_checks`]),
 /// so the latter is fast to call repeatedly and testable without a Python qldpc.
 pub struct CodeData {
-    memory: BlockData,
-    processor: BlockData,
+   pub memory: BlockData,
+    pub processor: BlockData,
     magic: BlockData,
 }
 
@@ -357,6 +371,31 @@ impl CodeData {
             processor: block(processor)?,
             magic: block(magic)?,
         })
+    }
+
+    /// The number of logical qubits in each block, as
+    /// `(memory, processor, magic)`.
+    pub fn logical_qubit_counts(&self) -> (usize, usize, usize) {
+        (
+            self.memory.logical_basis.len() / 2,
+            self.processor.logical_basis.len() / 2,
+            self.magic.logical_basis.len() / 2,
+        )
+    }
+
+    pub fn memory_basis(&self, basis: Pauli) -> Vec<PauliAxis<PhysicalQubit>> {
+        let basis_ops = &self.memory.logical_basis;
+        let half = basis_ops.len() / 2;
+        let (xs, zs) = basis_ops.split_at(half);
+        let lift = |s: &PhysicalPauliString| PauliAxis { sign: Sign::One, pauli_string: s.clone() };
+        match basis {
+            Pauli::X => xs.iter().map(lift).collect(),
+            Pauli::Z => zs.iter().map(lift).collect(),
+            // The logical Y on each qubit is the product of its X and Z operators
+            // (which carries the i phase from pauli_string_mult).
+            Pauli::Y => xs.iter().zip(zs).map(|(x, z)| pauli_string_mult(x, z)).collect(),
+            Pauli::I => Vec::new(),
+        }
     }
 }
 
@@ -448,7 +487,7 @@ fn bridged_checks(
     static_stabilizers : Vec<GraphPauli<BlockKind>>,
     sign: Sign,
     distance: usize,
-) -> (Vec<GraphPauli<BlockKind>>, Vec<CorrectionSupport<BlockKind>>) {
+) -> Deformation {
     let a_graph = surgery_graph(a.stabilizers, a.support, a.kind);
     let b_graph = surgery_graph(b.stabilizers, b.support, b.kind);
     let graph = bridge_surgery_graphs(&a_graph, &b_graph, distance);
@@ -474,10 +513,11 @@ fn bridged_checks(
         ),
     };
 
+    let edge_basis = operator_edge_basis(&operator);
     let mut checks = graph_to_checks(&graph, &code_stabilizers, &operator);
     checks.extend(static_stabilizers);
-    let support = get_correction_support(&graph, &operator);
-    (checks, support)
+    let corrections = get_correction_support(&graph, &operator);
+    Deformation { checks, corrections, edge_basis }
 }
 
 /// Build the merged-code checks for a support confined to the single block `b`: an
@@ -489,7 +529,7 @@ fn single_block_checks(
     b: BlockSurgery,
     static_stabilizers: Vec<GraphPauli<BlockKind>>,
     sign: Sign,
-) -> (Vec<GraphPauli<BlockKind>>, Vec<CorrectionSupport<BlockKind>>) {
+) -> Deformation {
     let graph = surgery_graph(b.stabilizers, b.support, b.kind);
 
     let code_stabilizers: Vec<CodePauli<BlockKind>> = b
@@ -503,17 +543,18 @@ fn single_block_checks(
         pauli_string: lift_physical_to_code(b.support, b.kind).pauli_string,
     };
 
+    let edge_basis = operator_edge_basis(&operator);
     let mut checks = graph_to_checks(&graph, &code_stabilizers, &operator);
     checks.extend(static_stabilizers);
-    let support = get_correction_support(&graph, &operator);
-    (checks, support)
+    let corrections = get_correction_support(&graph, &operator);
+    Deformation { checks, corrections, edge_basis }
 }
 
 fn physical_supports_to_stabilizer_sets(
     codes: &CodeData,
     distance: usize,
     supports: &[PhysicalSupport],
-) -> Vec<(Vec<GraphPauli<BlockKind>>, Vec<CorrectionSupport<BlockKind>>)> {
+) -> Vec<Deformation> {
     let processor_stabilizers = &codes.processor.stabilizers;
     let memory_stabilizers = &codes.memory.stabilizers;
     let magic_stabilizers = &codes.magic.stabilizers;
@@ -542,7 +583,7 @@ fn physical_supports_to_stabilizer_sets(
 
     let mut stabilizers = Vec::new();
     for support in supports {
-        let checks = match support.block_support() {
+        let deformation = match support.block_support() {
             BlockSupport::Single(support_ps, kind) => {
                 let (stabs, static_kinds) = match kind {
                     BlockKind::Memory => (memory_stabilizers, [BlockKind::Processor, BlockKind::Magic]),
@@ -577,7 +618,7 @@ fn physical_supports_to_stabilizer_sets(
                 distance,
             ),
         };
-        stabilizers.push(checks);
+        stabilizers.push(deformation);
     }
     stabilizers
 }
