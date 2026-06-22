@@ -397,6 +397,19 @@ impl CodeData {
             Pauli::I => Vec::new(),
         }
     }
+
+    /// The memory-block stabilizer generators of pure Pauli type `basis` (`X` or
+    /// `Z`) — exactly the ones reconstructable from a transversal `basis` readout
+    /// of the data qubits, used to declare the final-round boundary detectors.
+    /// Returns an empty list for `Y`/`I` (no single-type CSS stabilizer matches).
+    pub fn memory_stabilizers(&self, basis: Pauli) -> Vec<PauliAxis<PhysicalQubit>> {
+        self.memory
+            .stabilizers
+            .iter()
+            .filter(|s| !s.is_empty() && s.iter().all(|&(_, p)| p == basis))
+            .map(|s| PauliAxis { sign: Sign::One, pauli_string: s.clone() })
+            .collect()
+    }
 }
 
 fn operation_to_physical_support(

@@ -4,10 +4,10 @@ use crate::{
     checks_to_physical_circuit::PhysicalGate::DeclareObservable,
     circuit_to_checks::{
         BlockKind::{self, Memory},
-        CodeData, Deformation, DeformedCheckSequence,
+        CodeData, Deformation, DeformedCheckSequence, physical_supports_to_stabilizer_checks,
     },
     graph_to_checks::CorrectionSupport,
-    pbc::{GraphPauli, MergedCodeQubit, Pauli, PauliAxis, PauliStringIndex, Sign},
+    pbc::{GraphPauli, MergedCodeQubit, Pauli, PauliAxis, PauliStringIndex, PhysicalQubit, Sign},
 };
 
 /// The qubit type gates range over while the circuit is being built: a merged-code
@@ -61,7 +61,7 @@ fn flatten_gate<Q: PauliStringIndex>(
     intern: &mut impl FnMut(Q) -> usize,
 ) -> PhysicalGate<usize> {
     match gate {
-        PhysicalGate::Reset(q) => PhysicalGate::Reset(intern(*q)),
+        PhysicalGate::Reset(basis, q) => PhysicalGate::Reset(*basis, intern(*q)),
         PhysicalGate::Measure(basis, q) => PhysicalGate::Measure(*basis, intern(*q)),
         PhysicalGate::XCorrection(rec, q) => PhysicalGate::XCorrection(*rec, intern(*q)),
         PhysicalGate::DeclareObservable(index, recs) => {
@@ -96,9 +96,13 @@ fn write_gates<Q: std::fmt::Display + PauliStringIndex>(
     let mut i = 0;
     while i < gates.len() {
         match &gates[i] {
-            PhysicalGate::Reset(_) => {
-                write!(f, "{indent}R")?;
-                while let Some(PhysicalGate::Reset(q)) = gates.get(i) {
+            PhysicalGate::Reset(basis, _) => {
+                let basis = *basis;
+                write!(f, "{indent}R{basis}")?;
+                while let Some(PhysicalGate::Reset(b, q)) = gates.get(i) {
+                    if *b != basis {
+                        break;
+                    }
                     write!(f, " {q}")?;
                     i += 1;
                 }
@@ -150,7 +154,7 @@ impl<Q: std::fmt::Display + PauliStringIndex> std::fmt::Display for PhysicalGate
             Ok(())
         };
         match self {
-            PhysicalGate::Reset(q) => write!(f, "R {q}"),
+            PhysicalGate::Reset(basis, q) => write!(f, "R{basis} {q}"),
             PhysicalGate::Measure(basis, q) => write!(f, "M{basis} {q}"),
             PhysicalGate::XCorrection(rec, q) => write!(f, "CNOT rec[-{rec}] {q}"),
             PhysicalGate::DeclareObservable(index, recs) => {
@@ -198,7 +202,9 @@ fn concatenate_circuits(
 
 #[derive(Debug, Clone)]
 enum PhysicalGate<Q> {
-    Reset(Q),
+    /// Reset a qubit into the `+1` eigenstate of the given Pauli basis, lowered to
+    /// stim's `RX` / `RY` / `RZ` (`Z` is the usual `|0>`).
+    Reset(Pauli, Q),
     /// A single-qubit measurement in the given Pauli basis, lowered to stim's
     /// `MX` / `MY` / `MZ`.
     Measure(Pauli, Q),
@@ -233,7 +239,7 @@ pub fn checks_to_physical_circuit(
         .into_iter()
         .collect();
     for qubit in qubits {
-        circuit.add_gate(PhysicalGate::Reset(qubit));
+        circuit.add_gate(PhysicalGate::Reset(Pauli::Z, qubit));
     }
     for Deformation { checks, corrections, edge_basis: _ } in checks.deformations.into_iter() {
         let new_subcircuit =
@@ -301,7 +307,7 @@ fn initialization(checks: &Vec<GraphPauli<BlockKind>>) -> PhysicalCircuit<Merged
         .collect();
     let gates = edge_qubits
         .iter()
-        .map(|e| PhysicalGate::Reset(*e))
+        .map(|e| PhysicalGate::Reset(Pauli::Z, *e))
         .collect();
     PhysicalCircuit { gates }
 }
@@ -358,40 +364,135 @@ pub fn compile_memory_experiment(
     code: &CodeData,
     basis: Pauli,
 ) -> PhysicalCircuit<MergedQubit> {
-    let supports: Vec<Vec<(MergedQubit, Pauli)>> = code
-        .memory_basis(basis)
-        .iter()
-        .map(|m| {
-            m.pauli_string
-                .iter()
-                .map(|&(q, p)| {
-                    (MergedCodeQubit::CodeQubit { block: Memory, index: q.0 }, p)
-                })
-                .collect()
-        })
-        .collect();
-
     // Single-round build for the determinism solve, deep build for output.
     let single = checks_to_physical_circuit(checks.clone(), 1);
     let deep = checks_to_physical_circuit(checks, rounds);
+    append_memory_readout(&single, deep, code, basis)
+}
 
-    let solved = solve_memory_observables(&single, &supports);
-    let map = record_map(&single, &deep);
+/// Compile a *plain* memory experiment: the bare architecture code idling for
+/// `rounds` syndrome rounds, then the transversal `basis` readout — no logical
+/// operations, no code surgery, no deformations. This is the surgery-free baseline
+/// for debugging: it exercises only the round-over-round and final-readout
+/// detectors, so its circuit distance should track the code distance directly
+/// (unlike [`compile_memory_experiment`], whose surgery measurements are not yet
+/// fully detector-covered). See `scripts/diagnose_distance.py`.
+pub fn compile_plain_memory_experiment(
+    code: &CodeData,
+    rounds: usize,
+    basis: Pauli,
+) -> PhysicalCircuit<MergedQubit> {
+    // Empty supports => no deformations; we only want the lifted base checks.
+    let base_checks = physical_supports_to_stabilizer_checks(&[], code, 1).base_checks;
+    let single = plain_memory_rounds(&base_checks, 1, basis);
+    let deep = plain_memory_rounds(&base_checks, rounds, basis);
+    append_memory_readout(&single, deep, code, basis)
+}
+
+/// Reset every data qubit the checks touch, then measure all of them for `rounds`
+/// round-over-round syndrome rounds — the surgery-free analogue of
+/// [`checks_to_physical_circuit`] (which only emits rounds inside a deformation).
+fn plain_memory_rounds(
+    base_checks: &[GraphPauli<BlockKind>],
+    rounds: usize,
+    basis: Pauli,
+) -> PhysicalCircuit<MergedQubit> {
+    let mut circuit = PhysicalCircuit::new();
+    let qubits: Vec<MergedQubit> = base_checks
+        .iter()
+        .flat_map(|p| p.pauli_string.iter())
+        .map(|&(q, _)| q)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    // Initialize in the readout basis so the transversal readout is deterministic.
+    for q in qubits {
+        circuit.add_gate(PhysicalGate::Reset(basis, q));
+    }
+    concatenate_circuits(vec![circuit, d_rounds(base_checks.to_vec(), rounds)])
+}
+
+/// Append the transversal `basis` readout to a built memory circuit and declare
+/// its observables and final-boundary detectors. `single` is the 1-round build of
+/// the same circuit (used by the frame solver, whose records map into `deep` via
+/// [`record_map`]); `deep` is the full `rounds`-deep build whose gates we extend.
+///
+/// Both the logical observables and the final detectors follow the same recipe: a
+/// single transversal readout of every data qubit, then for each operator (a
+/// memory logical, or a `basis`-type stabilizer) the records that pin it = its
+/// readout records XOR the earlier records the solver says make it deterministic.
+/// Reconstructing the stabilizers this way ties the readout into the detector
+/// network; without it a late data error flips a logical with no detector firing.
+fn append_memory_readout(
+    single: &PhysicalCircuit<MergedQubit>,
+    deep: PhysicalCircuit<MergedQubit>,
+    code: &CodeData,
+    basis: Pauli,
+) -> PhysicalCircuit<MergedQubit> {
+    // Lift a memory-block operator basis (logicals or stabilizers) to merged-code
+    // qubit/Pauli supports.
+    let lift = |ops: Vec<PauliAxis<PhysicalQubit>>| -> Vec<Vec<(MergedQubit, Pauli)>> {
+        ops.iter()
+            .map(|m| {
+                m.pauli_string
+                    .iter()
+                    .map(|&(q, p)| {
+                        (MergedCodeQubit::CodeQubit { block: Memory, index: q.0 }, p)
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let supports = lift(code.memory_basis(basis));
+    let stab_supports = lift(code.memory_stabilizers(basis));
+
+    // Solve logicals and stabilizers together against the single-round circuit.
+    let all_ops: Vec<Vec<(MergedQubit, Pauli)>> =
+        supports.iter().chain(stab_supports.iter()).cloned().collect();
+    let FrameSolve { supports: solved, determinism_detectors } =
+        solve_memory_observables(single, &all_ops);
+    let map = record_map(single, &deep);
 
     let mut gates = deep.gates;
-    let mut running = measurement_count(&gates);
+
+    // One transversal `basis` readout of every data qubit appearing in any logical
+    // or stabilizer support, shared by all observables and final detectors.
+    let readout_qubits: Vec<MergedQubit> = all_ops
+        .iter()
+        .flat_map(|s| s.iter().map(|&(q, _)| q))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let pre_readout = measurement_count(&gates);
+    let mut rec_abs: BTreeMap<MergedQubit, usize> = BTreeMap::new();
+    for (i, &q) in readout_qubits.iter().enumerate() {
+        rec_abs.insert(q, pre_readout + i);
+        gates.push(PhysicalGate::Measure(basis, q));
+    }
+    let running = pre_readout + readout_qubits.len();
+
+    // The rec[-k] offsets that pin operator `op`: its transversal readout records
+    // plus the earlier records the frame solver says make it deterministic.
+    let offsets_for = |op: &[(MergedQubit, Pauli)], records: &[usize]| -> Vec<usize> {
+        let mut offs: Vec<usize> = op.iter().map(|&(q, _)| running - rec_abs[&q]).collect();
+        offs.extend(records.iter().map(|&r1| running - map[r1]));
+        offs
+    };
+
     for (i, support) in supports.iter().enumerate() {
         let Some(records) = &solved[i] else { continue };
-        for &(qubit, pauli) in support {
-            gates.push(PhysicalGate::Measure(pauli, qubit));
-            running += 1;
-        }
-        // Offsets back from the running measurement count: the freshly-appended
-        // transversal readout records (`1..=support.len()`) plus each solver
-        // record mapped into the deep circuit.
-        let mut offsets: Vec<usize> = (1..=support.len()).collect();
-        offsets.extend(records.iter().map(|&r1| running - map[r1]));
-        gates.push(DeclareObservable(i, offsets));
+        gates.push(DeclareObservable(i, offsets_for(support, records)));
+    }
+    for (j, stab) in stab_supports.iter().enumerate() {
+        let Some(records) = &solved[supports.len() + j] else { continue };
+        gates.push(PhysicalGate::DeclareDetector(offsets_for(stab, records)));
+    }
+    // Cover every deterministic measurement (reference-round checks and the split
+    // edge `MZ` outcomes). Each detector's records are all pre-readout, so offsets
+    // are computed straight off `map`.
+    for records in &determinism_detectors {
+        let offs = records.iter().map(|&r| running - map[r]).collect();
+        gates.push(PhysicalGate::DeclareDetector(offs));
     }
     PhysicalCircuit { gates }
 }
@@ -445,10 +546,24 @@ fn record_map<Q>(single: &PhysicalCircuit<Q>, deep: &PhysicalCircuit<Q>) -> Vec<
 /// (destabilizer rows `0..n`, stabilizer rows `n..2n`) whose per-generator sign is
 /// carried *symbolically* as the GF(2) set of measurement records whose parity
 /// gives it (the constant phase is dropped, since it does not affect determinism).
+/// Whether bit `q` is set in a bit-packed row.
+#[inline]
+fn get_bit(row: &[u64], q: usize) -> bool {
+    (row[q >> 6] >> (q & 63)) & 1 != 0
+}
+
+/// Set bit `q` in a bit-packed row.
+#[inline]
+fn set_bit(row: &mut [u64], q: usize) {
+    row[q >> 6] |= 1u64 << (q & 63);
+}
+
 struct FrameSim {
     n: usize,
-    x: Vec<Vec<bool>>,
-    z: Vec<Vec<bool>>,
+    /// Number of `u64` words per bit-packed row (`ceil(n / 64)`).
+    words: usize,
+    x: Vec<Vec<u64>>,
+    z: Vec<Vec<u64>>,
     sym: Vec<std::collections::BTreeSet<usize>>,
     /// Symbolic value of each measurement record (in measurement order).
     rec: Vec<std::collections::BTreeSet<usize>>,
@@ -456,27 +571,48 @@ struct FrameSim {
 
 impl FrameSim {
     fn new(n: usize) -> Self {
-        let mut x = vec![vec![false; n]; 2 * n];
-        let mut z = vec![vec![false; n]; 2 * n];
+        let words = n.div_ceil(64);
+        let mut x = vec![vec![0u64; words]; 2 * n];
+        let mut z = vec![vec![0u64; words]; 2 * n];
         for i in 0..n {
-            x[i][i] = true; // destabilizer i = X_i
-            z[n + i][i] = true; // stabilizer i = Z_i
+            set_bit(&mut x[i], i); // destabilizer i = X_i
+            set_bit(&mut z[n + i], i); // stabilizer i = Z_i
         }
-        FrameSim { n, x, z, sym: vec![std::collections::BTreeSet::new(); 2 * n], rec: Vec::new() }
+        FrameSim {
+            n,
+            words,
+            x,
+            z,
+            sym: vec![std::collections::BTreeSet::new(); 2 * n],
+            rec: Vec::new(),
+        }
     }
 
-    /// Whether tableau row `r` anticommutes with the Pauli `(px, pz)`.
-    fn anticommutes(&self, r: usize, px: &[bool], pz: &[bool]) -> bool {
-        let mut parity = false;
-        for k in 0..self.n {
-            parity ^= (self.x[r][k] & pz[k]) ^ (self.z[r][k] & px[k]);
+    /// Bit-pack a `&[bool]` Pauli support into one `u64` word per 64 qubits.
+    fn pack(&self, p: &[bool]) -> Vec<u64> {
+        let mut w = vec![0u64; self.words];
+        for (i, &b) in p.iter().enumerate() {
+            if b {
+                set_bit(&mut w, i);
+            }
         }
-        parity
+        w
+    }
+
+    /// Whether tableau row `r` anticommutes with the bit-packed Pauli `(px, pz)`.
+    /// The symplectic inner product is the parity of the XOR of `x[r]&pz` and
+    /// `z[r]&px` accumulated word-wise, then popcounted.
+    fn anticommutes(&self, r: usize, px: &[u64], pz: &[u64]) -> bool {
+        let mut acc = 0u64;
+        for k in 0..self.words {
+            acc ^= (self.x[r][k] & pz[k]) ^ (self.z[r][k] & px[k]);
+        }
+        acc.count_ones() & 1 == 1
     }
 
     /// Left-multiply row `i` by row `j` (symplectic XOR; symbolic-sign XOR).
     fn row_mul(&mut self, i: usize, j: usize) {
-        for k in 0..self.n {
+        for k in 0..self.words {
             self.x[i][k] ^= self.x[j][k];
             self.z[i][k] ^= self.z[j][k];
         }
@@ -487,14 +623,16 @@ impl FrameSim {
     /// symbolic value (a fresh variable if random, else the determined combination).
     fn measure(&mut self, px: &[bool], pz: &[bool]) {
         let rid = self.rec.len();
+        let pxw = self.pack(px);
+        let pzw = self.pack(pz);
         let anti: Vec<usize> = (self.n..2 * self.n)
-            .filter(|&r| self.anticommutes(r, px, pz))
+            .filter(|&r| self.anticommutes(r, &pxw, &pzw))
             .collect();
         if let Some(&pivot) = anti.first() {
             // Random: isolate `pivot` as the only anticommuting row, then replace it
             // with the measured Pauli carrying a fresh record variable.
             for r in 0..2 * self.n {
-                if r != pivot && self.anticommutes(r, px, pz) {
+                if r != pivot && self.anticommutes(r, &pxw, &pzw) {
                     self.row_mul(r, pivot);
                 }
             }
@@ -502,8 +640,8 @@ impl FrameSim {
             self.x[dest] = self.x[pivot].clone();
             self.z[dest] = self.z[pivot].clone();
             self.sym[dest] = self.sym[pivot].clone();
-            self.x[pivot] = px.to_vec();
-            self.z[pivot] = pz.to_vec();
+            self.x[pivot] = pxw;
+            self.z[pivot] = pzw;
             self.sym[pivot] = std::collections::BTreeSet::from([rid]);
             self.rec.push(std::collections::BTreeSet::from([rid]));
         } else {
@@ -511,7 +649,7 @@ impl FrameSim {
             // anticommutes with the measured Pauli.
             let mut s = std::collections::BTreeSet::new();
             for d in 0..self.n {
-                if self.anticommutes(d, px, pz) {
+                if self.anticommutes(d, &pxw, &pzw) {
                     s = &s ^ &self.sym[self.n + d];
                 }
             }
@@ -519,15 +657,21 @@ impl FrameSim {
         }
     }
 
-    /// Reset qubit `q` to `|0>`: project onto `Z_q` and force its sign constant.
-    /// Unlike a measurement this allocates *no* record (a reset emits none), so the
-    /// record indices stay aligned with the circuit's real measurements.
-    fn reset(&mut self, q: usize) {
-        // Stabilizer rows anticommuting with `Z_q` carry `X`/`Y` on `q`.
-        let anti: Vec<usize> = (self.n..2 * self.n).filter(|&r| self.x[r][q]).collect();
+    /// Reset qubit `q` into the `+1` eigenstate of `basis` (`Z`->`|0>`, `X`->`|+>`):
+    /// project onto `basis_q` and force its sign constant. Unlike a measurement this
+    /// allocates *no* record (a reset emits none), so the record indices stay aligned
+    /// with the circuit's real measurements. `basis` must be `X` or `Z`.
+    fn reset(&mut self, basis: Pauli, q: usize) {
+        // A row anticommutes with `basis_q` iff it carries the conjugate single-qubit
+        // Pauli on `q`: for `Z_q` an `X`/`Y` (x bit set), for `X_q` a `Z`/`Y` (z bit).
+        let anticommutes = |sim: &Self, r: usize| match basis {
+            Pauli::X => get_bit(&sim.z[r], q),
+            _ => get_bit(&sim.x[r], q),
+        };
+        let anti: Vec<usize> = (self.n..2 * self.n).filter(|&r| anticommutes(self, r)).collect();
         if let Some(&pivot) = anti.first() {
             for r in 0..2 * self.n {
-                if r != pivot && self.x[r][q] {
+                if r != pivot && anticommutes(self, r) {
                     self.row_mul(r, pivot);
                 }
             }
@@ -535,17 +679,29 @@ impl FrameSim {
             self.x[dest] = self.x[pivot].clone();
             self.z[dest] = self.z[pivot].clone();
             self.sym[dest] = self.sym[pivot].clone();
-            self.x[pivot] = vec![false; self.n];
-            self.z[pivot] = vec![false; self.n];
-            self.z[pivot][q] = true; // stabilizer becomes Z_q
-            self.sym[pivot].clear(); // |0> is deterministic +1
+            self.x[pivot] = vec![0u64; self.words];
+            self.z[pivot] = vec![0u64; self.words];
+            match basis {
+                Pauli::X => set_bit(&mut self.x[pivot], q), // stabilizer becomes X_q
+                _ => set_bit(&mut self.z[pivot], q),        // stabilizer becomes Z_q
+            }
+            self.sym[pivot].clear(); // a reset state is deterministic +1
         } else {
-            // `Z_q` already a stabilizer; clear the single-qubit `Z_q` generator.
+            // `basis_q` is already a stabilizer; clear its single-qubit generator's sign.
             for r in self.n..2 * self.n {
-                if self.z[r][q]
-                    && !self.x[r].iter().any(|&b| b)
-                    && self.z[r].iter().filter(|&&b| b).count() == 1
-                {
+                let single_qubit_basis = match basis {
+                    Pauli::X => {
+                        get_bit(&self.x[r], q)
+                            && self.z[r].iter().all(|&w| w == 0)
+                            && self.x[r].iter().map(|w| w.count_ones()).sum::<u32>() == 1
+                    }
+                    _ => {
+                        get_bit(&self.z[r], q)
+                            && self.x[r].iter().all(|&w| w == 0)
+                            && self.z[r].iter().map(|w| w.count_ones()).sum::<u32>() == 1
+                    }
+                };
+                if single_qubit_basis {
                     self.sym[r].clear();
                     break;
                 }
@@ -559,7 +715,7 @@ impl FrameSim {
     fn x_correction(&mut self, rid: usize, q: usize) {
         let ctrl = self.rec[rid].clone();
         for r in 0..2 * self.n {
-            if self.z[r][q] {
+            if get_bit(&self.z[r], q) {
                 self.sym[r] = &self.sym[r] ^ &ctrl;
             }
         }
@@ -568,12 +724,14 @@ impl FrameSim {
     /// The record set making the Pauli `(px, pz)` deterministic, or `None` if it
     /// anticommutes with the current stabilizer group (non-deterministic).
     fn solve(&self, px: &[bool], pz: &[bool]) -> Option<Vec<usize>> {
-        if (self.n..2 * self.n).any(|r| self.anticommutes(r, px, pz)) {
+        let pxw = self.pack(px);
+        let pzw = self.pack(pz);
+        if (self.n..2 * self.n).any(|r| self.anticommutes(r, &pxw, &pzw)) {
             return None;
         }
         let mut s = std::collections::BTreeSet::new();
         for d in 0..self.n {
-            if self.anticommutes(d, px, pz) {
+            if self.anticommutes(d, &pxw, &pzw) {
                 s = &s ^ &self.sym[self.n + d];
             }
         }
@@ -581,14 +739,33 @@ impl FrameSim {
     }
 }
 
+/// The result of running the frame solver over a deformation circuit: for each
+/// requested `support`, the record combination pinning its readout (`None` if
+/// non-deterministic); plus, for every deterministic measurement the circuit makes,
+/// the record set forming a detector on it.
+struct FrameSolve {
+    /// One entry per requested support, in input order.
+    supports: Vec<Option<Vec<usize>>>,
+    /// Record sets (single-circuit numbering) whose parity is deterministically 0:
+    /// each is `{rid}` of a deterministic measurement XOR the earlier records the
+    /// solver says determine it. These cover (a) the split edge `MZ` outcomes the
+    /// surgery folds into the observable, and (b) the *reference* round of each
+    /// `d_rounds` segment — deterministic after the Z resets but left undetected
+    /// since round-over-round detectors only compare rounds 2..N. Without them a
+    /// data error before round 1, or a split-`MZ` flip, is a weight-1 logical path.
+    determinism_detectors: Vec<Vec<usize>>,
+}
+
 /// Run the symbolic frame simulator over `circuit` (a single-round deformation
 /// circuit, before the final readout) and solve, for each memory logical's
 /// transversal `support`, the record combination that pins its readout — or
-/// `None` if the circuit leaves it non-deterministic.
+/// `None` if the circuit leaves it non-deterministic. Also collects a detector for
+/// every deterministic measurement so the reference rounds and the surgery's edge
+/// readouts are detector-covered.
 fn solve_memory_observables(
     circuit: &PhysicalCircuit<MergedQubit>,
     supports: &[Vec<(MergedQubit, Pauli)>],
-) -> Vec<Option<Vec<usize>>> {
+) -> FrameSolve {
     // Intern every qubit (circuit gates plus readout supports) to a dense index.
     let mut index: BTreeMap<MergedQubit, usize> = BTreeMap::new();
     let mut intern = |q: MergedQubit, index: &mut BTreeMap<MergedQubit, usize>| -> usize {
@@ -598,9 +775,9 @@ fn solve_memory_observables(
     fn collect_qubits(gates: &[PhysicalGate<MergedQubit>], out: &mut Vec<MergedQubit>) {
         for g in gates {
             match g {
-                PhysicalGate::Reset(q) | PhysicalGate::Measure(_, q) | PhysicalGate::XCorrection(_, q) => {
-                    out.push(*q)
-                }
+                PhysicalGate::Reset(_, q)
+                | PhysicalGate::Measure(_, q)
+                | PhysicalGate::XCorrection(_, q) => out.push(*q),
                 PhysicalGate::MPP(p) => out.extend(p.pauli_string.iter().map(|&(q, _)| q)),
                 PhysicalGate::Repeat(_, body) => collect_qubits(body, out),
                 _ => {}
@@ -636,18 +813,23 @@ fn solve_memory_observables(
 
     let mut sim = FrameSim::new(n);
     let mut measured = 0usize;
+    // Record ids of every measurement (MPP checks and split `Measure`s), to
+    // detector-cover the deterministic ones afterwards.
+    let mut measure_rids: Vec<usize> = Vec::new();
     for g in &circuit.gates {
         match g {
-            PhysicalGate::Reset(q) => sim.reset(index[q]),
+            PhysicalGate::Reset(basis, q) => sim.reset(*basis, index[q]),
             PhysicalGate::Measure(pauli, q) => {
                 let (x, z) = pauli_vecs(&[(*q, *pauli)], &index);
                 sim.measure(&x, &z);
+                measure_rids.push(measured);
                 measured += 1;
             }
             PhysicalGate::MPP(p) => {
                 let pairs: Vec<(MergedQubit, Pauli)> = p.pauli_string.iter().copied().collect();
                 let (x, z) = pauli_vecs(&pairs, &index);
                 sim.measure(&x, &z);
+                measure_rids.push(measured);
                 measured += 1;
             }
             PhysicalGate::XCorrection(offset, q) => {
@@ -659,11 +841,27 @@ fn solve_memory_observables(
         }
     }
 
-    supports
+    let solved = supports
         .iter()
         .map(|support| {
             let (x, z) = pauli_vecs(support, &index);
             sim.solve(&x, &z)
         })
-        .collect()
+        .collect();
+
+    // A measurement is deterministic iff its symbolic value is a combination of
+    // *earlier* records (it does not carry its own fresh variable). For those, the
+    // measured outcome equals the parity of `sim.rec[rid]`, so `{rid} ∪ sim.rec[rid]`
+    // is a record set with deterministic parity 0 — a detector covering it.
+    let determinism_detectors = measure_rids
+        .into_iter()
+        .filter(|&rid| !sim.rec[rid].contains(&rid))
+        .map(|rid| {
+            let mut set = sim.rec[rid].clone();
+            set.insert(rid);
+            set.into_iter().collect()
+        })
+        .collect();
+
+    FrameSolve { supports: solved, determinism_detectors }
 }

@@ -234,7 +234,14 @@ def main():
     )
 
     noisy = add_noise(circuit, args.p_meas, args.p_data)
-    decode(noisy, args.shots, args.max_iter, args.osd_order, args.seed)
+    shortest = noisy.shortest_graphlike_error()
+    print(f"shortest graphlike error: {shortest[0].dem_error_terms}")
+    print(f"distance: {len(shortest)}")
+    with open("noisy.stim", "w") as f:
+        f.write(str(noisy))
+    with open("dem.txt", "w") as f:
+        f.write(str(noisy.detector_error_model()))
+    # decode(noisy, args.shots, args.max_iter, args.osd_order, args.seed)
 
 
 if __name__ == "__main__":
