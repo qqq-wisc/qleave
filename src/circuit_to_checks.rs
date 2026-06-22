@@ -1,5 +1,5 @@
 use crate::{
-    graph_construction::{bridge_surgery_graphs, surgery_graph},
+    graph_construction::{SurgeryGraphConfig, bridge_surgery_graphs, surgery_graph},
     graph_to_checks::{CorrectionSupport, get_correction_support, graph_to_checks, operator_edge_basis},
     pbc::{
         ArchitectureQubit::{Magic, Memory, Processor}, CodePauli, CodeQubit, GraphPauli, Pauli, PauliAxis, PauliProductCircuit, PauliProductOperation, PauliString, PhysicalPauliString, PhysicalQubit, Sign, lift_code_to_merged, pauli_string_mult
@@ -32,7 +32,7 @@ pub struct Deformation {
 /// [`CodeData::from_blocks`]), so this step shells out to nothing and never fails.
 
 
-pub fn physical_supports_to_stabilizer_checks(supports: &[PhysicalSupport], codes: &CodeData, distance: usize) -> DeformedCheckSequence{
+pub fn physical_supports_to_stabilizer_checks(supports: &[PhysicalSupport], codes: &CodeData, distance: usize, config: &SurgeryGraphConfig) -> DeformedCheckSequence{
     let lift_stabilizers = |block: &BlockData, kind| {
         block
             .stabilizers
@@ -46,7 +46,7 @@ pub fn physical_supports_to_stabilizer_checks(supports: &[PhysicalSupport], code
         lift_stabilizers(&codes.magic, BlockKind::Magic),
     ]
     .concat();
-    let deformations = physical_supports_to_stabilizer_sets(codes, distance, &supports);
+    let deformations = physical_supports_to_stabilizer_sets(codes, distance, &supports, config);
     DeformedCheckSequence { base_checks, deformations }
 }
 
@@ -500,9 +500,10 @@ fn bridged_checks(
     static_stabilizers : Vec<GraphPauli<BlockKind>>,
     sign: Sign,
     distance: usize,
+    config: &SurgeryGraphConfig,
 ) -> Deformation {
-    let a_graph = surgery_graph(a.stabilizers, a.support, a.kind);
-    let b_graph = surgery_graph(b.stabilizers, b.support, b.kind);
+    let a_graph = surgery_graph(a.stabilizers, a.support, a.kind, config);
+    let b_graph = surgery_graph(b.stabilizers, b.support, b.kind, config);
     let graph = bridge_surgery_graphs(&a_graph, &b_graph, distance);
 
     let code_stabilizers: Vec<CodePauli<BlockKind>> = a
@@ -542,8 +543,9 @@ fn single_block_checks(
     b: BlockSurgery,
     static_stabilizers: Vec<GraphPauli<BlockKind>>,
     sign: Sign,
+    config: &SurgeryGraphConfig,
 ) -> Deformation {
-    let graph = surgery_graph(b.stabilizers, b.support, b.kind);
+    let graph = surgery_graph(b.stabilizers, b.support, b.kind, config);
 
     let code_stabilizers: Vec<CodePauli<BlockKind>> = b
         .stabilizers
@@ -567,6 +569,7 @@ fn physical_supports_to_stabilizer_sets(
     codes: &CodeData,
     distance: usize,
     supports: &[PhysicalSupport],
+    config: &SurgeryGraphConfig,
 ) -> Vec<Deformation> {
     let processor_stabilizers = &codes.processor.stabilizers;
     let memory_stabilizers = &codes.memory.stabilizers;
@@ -607,6 +610,7 @@ fn physical_supports_to_stabilizer_sets(
                     block(stabs, support_ps, kind),
                     lift_static(static_kinds),
                     support.sign,
+                    config,
                 )
             }
             BlockSupport::MemoryProcessor(memory, processor) => bridged_checks(
@@ -615,6 +619,7 @@ fn physical_supports_to_stabilizer_sets(
                 magic_stabilizers.iter().map(|s| lift_physical_to_merged(s, BlockKind::Magic)).collect(),
                 support.sign,
                 distance,
+                config,
             ),
             BlockSupport::MemoryMagic(memory, magic) => bridged_checks(
                 block(memory_stabilizers, memory, BlockKind::Memory),
@@ -622,6 +627,7 @@ fn physical_supports_to_stabilizer_sets(
                 processor_stabilizers.iter().map(|s| lift_physical_to_merged(s, BlockKind::Processor)).collect(),
                 support.sign,
                 distance,
+                config,
             ),
             BlockSupport::ProcessorMagic(processor, magic) => bridged_checks(
                 block(processor_stabilizers, processor, BlockKind::Processor),
@@ -629,6 +635,7 @@ fn physical_supports_to_stabilizer_sets(
                 memory_stabilizers.iter().map(|s| lift_physical_to_merged(s, BlockKind::Memory)).collect(),
                 support.sign,
                 distance,
+                config,
             ),
         };
         stabilizers.push(deformation);

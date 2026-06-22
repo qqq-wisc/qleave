@@ -56,12 +56,13 @@ pub fn surgery_graph<K: Ord + Copy>(
     stabilizers: &Vec<PhysicalPauliString>,
     operator: &PhysicalPauliString,
     block_name: K,
+    config: &SurgeryGraphConfig,
 ) -> SurgeryGraph<K> {
     let (path_graph, path_matching) = path_matching_graph(&stabilizers, &operator);
     let expander =
-        build_congestion_aware_expander(&path_graph, 100, &mut StdRng::seed_from_u64(42));
+        build_congestion_aware_expander(&path_graph, config, &mut StdRng::seed_from_u64(config.seed));
     let thickend = thicken(&expander);
-    let cellulated = cellulate(&thickend, 4);
+    let cellulated = cellulate(&thickend, config.max_check_degree);
     // The cellulated graph is unlabeled (`UnGraph<(), ()>`); lift it to carry node
     // weights, then label each port vertex with its code qubit. The ports are the
     // operator's support, vertices `0..|support|` in the order `path_matching_graph`
@@ -420,14 +421,56 @@ fn conditioned_expander_graph(
     g
 }
 
+/// Tuning parameters for the [`surgery_graph`] construction pipeline: the
+/// randomized congestion-aware expander build (`trials` and the three fields
+/// forwarded to [`congestion_aware_expander`]), the RNG `seed` that makes that
+/// build deterministic, and the cellulation `max_check_degree`. [`Default`]
+/// reproduces the values that were previously hard-coded.
+#[derive(Clone, Copy, Debug)]
+pub struct SurgeryGraphConfig {
+    /// Number of randomized expander constructions to try (smallest wins).
+    pub trials: usize,
+    /// `reset_period` passed to [`congestion_aware_expander`].
+    pub reset_period: usize,
+    /// `max_iterations` passed to [`congestion_aware_expander`].
+    pub max_iterations: usize,
+    /// `qubit_degree` (`d_q`) passed to [`congestion_aware_expander`].
+    pub qubit_degree: usize,
+    /// Seed for the RNG driving the (randomized) expander construction; fixing
+    /// it makes [`surgery_graph`] deterministic.
+    pub seed: u64,
+    /// `max_check_degree` passed to [`cellulate`]: the largest face (cycle
+    /// check) degree the zigzag cellulation may produce.
+    pub max_check_degree: usize,
+}
+
+impl Default for SurgeryGraphConfig {
+    fn default() -> Self {
+        Self {
+            trials: 100,
+            reset_period: 2,
+            max_iterations: 8,
+            qubit_degree: 5,
+            seed: 42,
+            max_check_degree: 4,
+        }
+    }
+}
+
 fn build_congestion_aware_expander(
     g0: &UnGraph<(), ()>,
-    trials: usize,
+    config: &SurgeryGraphConfig,
     rng: &mut impl Rng,
 ) -> CongestionAwareExpander {
     let mut best: Option<CongestionAwareExpander> = None;
-    for _ in 0..trials.max(1) {
-        let g = congestion_aware_expander(g0, 2, 8, 5, rng);
+    for _ in 0..config.trials.max(1) {
+        let g = congestion_aware_expander(
+            g0,
+            config.reset_period,
+            config.max_iterations,
+            config.qubit_degree,
+            rng,
+        );
         let smaller = best
             .as_ref()
             .is_none_or(|b| g.graph.edge_count() < b.graph.edge_count());
@@ -1599,7 +1642,7 @@ mod tests {
         let g0 = graph_from_edges(6, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]);
         let beta = 0.3;
         let mut rng = StdRng::seed_from_u64(7);
-        let g = build_congestion_aware_expander(&g0, 100, &mut rng);
+        let g = build_congestion_aware_expander(&g0, &SurgeryGraphConfig::default(), &mut rng);
         assert!(laplacian_lambda2(&g.graph) >= 2.0 * beta);
     }
 
@@ -2334,8 +2377,8 @@ mod tests {
             ps(vec![Pauli::I, Pauli::I, Pauli::Z, Pauli::Z]),
         ];
 
-        let s1 = surgery_graph(&stabs1, &op1, "left");
-        let s2 = surgery_graph(&stabs2, &op2, "right");
+        let s1 = surgery_graph(&stabs1, &op1, "left", &SurgeryGraphConfig::default());
+        let s2 = surgery_graph(&stabs2, &op2, "right", &SurgeryGraphConfig::default());
         let (n1, e1) = (s1.graph.node_count(), s1.graph.edge_count());
         let (n2, e2) = (s2.graph.node_count(), s2.graph.edge_count());
 

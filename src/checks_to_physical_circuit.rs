@@ -6,6 +6,7 @@ use crate::{
         BlockKind::{self, Memory},
         CodeData, Deformation, DeformedCheckSequence, physical_supports_to_stabilizer_checks,
     },
+    graph_construction::SurgeryGraphConfig,
     graph_to_checks::CorrectionSupport,
     pbc::{GraphPauli, MergedCodeQubit, Pauli, PauliAxis, PauliStringIndex, PhysicalQubit, Sign},
 };
@@ -383,7 +384,8 @@ pub fn compile_plain_memory_experiment(
     basis: Pauli,
 ) -> PhysicalCircuit<MergedQubit> {
     // Empty supports => no deformations; we only want the lifted base checks.
-    let base_checks = physical_supports_to_stabilizer_checks(&[], code, 1).base_checks;
+    let base_checks =
+        physical_supports_to_stabilizer_checks(&[], code, 1, &SurgeryGraphConfig::default()).base_checks;
     let single = plain_memory_rounds(&base_checks, 1, basis);
     let deep = plain_memory_rounds(&base_checks, rounds, basis);
     append_memory_readout(&single, deep, code, basis)

@@ -220,7 +220,7 @@ pub fn get_correction_support<K : Ord + Copy>(graph: &SurgeryGraph<K>, operator:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph_construction::surgery_graph;
+    use crate::graph_construction::{SurgeryGraphConfig, surgery_graph};
     use crate::pbc::{
         CodeQubit, PauliAxis, PhysicalPauliString, PhysicalQubit, axes_commute, pauli_string_mult,
     };
@@ -278,7 +278,7 @@ mod tests {
         ];
         let stabs: Vec<_> = stab_paulis.iter().map(|s| physical(s)).collect();
         let code_stabilizers: Vec<_> = stab_paulis.iter().map(|s| code_pauli(s)).collect();
-        let graph = surgery_graph(&stabs, &physical(&[Pauli::X, Pauli::X, Pauli::X, Pauli::X]), BLOCK);
+        let graph = surgery_graph(&stabs, &physical(&[Pauli::X, Pauli::X, Pauli::X, Pauli::X]), BLOCK, &SurgeryGraphConfig::default());
         (graph, code_stabilizers, operator)
     }
 

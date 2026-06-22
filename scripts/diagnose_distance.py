@@ -128,6 +128,9 @@ def main():
         f"(det-set<={args.max_det_set}, edge-degree<={args.max_edge_degree}, "
         f"{'exhaustive' if args.exhaustive else 'greedy'})..."
     )
+    with open("shortest_error.sat", "w") as f:
+            print("Writing shortest error to shortest_error.sat")
+            f.write(noisy.shortest_error_sat_problem())
     try:
         errors = noisy.search_for_undetectable_logical_errors(
             dont_explore_detection_event_sets_with_size_above=args.max_det_set,
@@ -135,6 +138,7 @@ def main():
             dont_explore_edges_increasing_symptom_degree=not args.exhaustive,
             canonicalize_circuit_errors=True,
         )
+
         print(f"Circuit distance: {len(errors)}")
         for i, e in enumerate(errors):
             for loc in e.circuit_error_locations:

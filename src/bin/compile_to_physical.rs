@@ -25,6 +25,7 @@ use qleave::{
         physical_supports_to_stabilizer_checks,
     },
     compile::compile,
+    graph_construction::SurgeryGraphConfig,
     parse::parse,
     pbc::{
         ArchitectureQubit::{self, Magic, Memory, Processor},
@@ -45,7 +46,7 @@ fn ppc_to_physical_circuit(
 ) -> Result<PhysicalCircuit<usize>, Box<dyn std::error::Error>> {
     let codes = CodeData::from_blocks(memory_block, processor_block, magic_block)?;
     let supports = pauli_product_circuit_to_physical_supports(circ, &codes);
-    let checks = physical_supports_to_stabilizer_checks(&supports, &codes, distance);
+    let checks = physical_supports_to_stabilizer_checks(&supports, &codes, distance, &SurgeryGraphConfig::default());
     Ok(checks_to_physical_circuit(checks, distance).flatten())
 }
 
@@ -62,7 +63,7 @@ fn logical_circuit_to_physical_circuit(
     let supports = pauli_product_circuit_to_physical_supports(&ppm, &codes);
     let support_len = supports.len();
     eprintln!("Number of supports: {support_len}");
-    let checks = physical_supports_to_stabilizer_checks(&supports, &codes, distance);
+    let checks = physical_supports_to_stabilizer_checks(&supports, &codes, distance, &SurgeryGraphConfig::default());
     Ok(checks_to_physical_circuit(checks, distance).flatten())
 }
 
@@ -165,7 +166,7 @@ fn memory_experiment() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DISTANCE);
     let supports = pauli_product_circuit_to_physical_supports(&ppm, &codes);
-    let checks = physical_supports_to_stabilizer_checks(&supports, &codes, distance);
+    let checks = physical_supports_to_stabilizer_checks(&supports, &codes, distance, &SurgeryGraphConfig::default());
     let memory = compile_memory_experiment(checks, distance, &codes, Pauli::X);
     print!("{}", memory.flatten());
     Ok(())
@@ -180,7 +181,7 @@ fn lower_ppm_to_file(
     distance: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let supports = pauli_product_circuit_to_physical_supports(ppm, codes);
-    let checks = physical_supports_to_stabilizer_checks(&supports, codes, distance);
+    let checks = physical_supports_to_stabilizer_checks(&supports, codes, distance, &SurgeryGraphConfig::default());
     let memory = compile_memory_experiment(checks, distance, codes, Pauli::Z);
     fs::write(path, format!("{}", memory.flatten()))?;
     Ok(())

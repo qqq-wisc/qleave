@@ -11,6 +11,7 @@ use qleave::{
         physical_supports_to_stabilizer_checks,
     },
     compile::{compile, compile_steps},
+    graph_construction::SurgeryGraphConfig,
     parse::parse,
     pbc::Pauli,
 };
@@ -128,6 +129,50 @@ struct Cli {
     /// (to_physical) Logical basis the memory experiment reads out.
     #[arg(long, value_enum, default_value_t = Basis::Z)]
     basis: Basis,
+
+    /// (to_physical) Number of randomized congestion-aware expander
+    /// constructions to try per surgery graph; the smallest result is kept.
+    #[arg(long, default_value_t = SurgeryGraphConfig::default().trials)]
+    expander_trials: usize,
+
+    /// (to_physical) Expander construction: rebuild the BFS spanning forest
+    /// every this-many steps (keeps tree paths short).
+    #[arg(long, default_value_t = SurgeryGraphConfig::default().reset_period)]
+    expander_reset_period: usize,
+
+    /// (to_physical) Expander construction: iteration bound for the random
+    /// matching phase (Phase 2).
+    #[arg(long, default_value_t = SurgeryGraphConfig::default().max_iterations)]
+    expander_max_iterations: usize,
+
+    /// (to_physical) Expander construction: LDPC qubit-degree bound `d_q` used
+    /// by the degree-aware cycle partition (larger packs more cycles per layer).
+    #[arg(long, default_value_t = SurgeryGraphConfig::default().qubit_degree)]
+    expander_qubit_degree: usize,
+
+    /// (to_physical) Seed for the RNG driving the randomized expander
+    /// construction; fixing it keeps surgery-graph construction deterministic.
+    #[arg(long, default_value_t = SurgeryGraphConfig::default().seed)]
+    surgery_seed: u64,
+
+    /// (to_physical) Cellulation: the largest face (cycle check) degree the
+    /// zigzag cellulation may produce.
+    #[arg(long, default_value_t = SurgeryGraphConfig::default().max_check_degree)]
+    cellulation_degree: usize,
+}
+
+impl Cli {
+    /// Assemble the surgery-graph tuning parameters from the relevant flags.
+    fn surgery_graph_config(&self) -> SurgeryGraphConfig {
+        SurgeryGraphConfig {
+            trials: self.expander_trials,
+            reset_period: self.expander_reset_period,
+            max_iterations: self.expander_max_iterations,
+            qubit_degree: self.expander_qubit_degree,
+            seed: self.surgery_seed,
+            max_check_degree: self.cellulation_degree,
+        }
+    }
 }
 
 fn main() {
@@ -280,7 +325,7 @@ fn run_to_physical(cli: &Cli, circuit_path: &Path, circuit: Circuit) {
 
     let supports = pauli_product_circuit_to_physical_supports(&ppm, &codes);
     eprintln!("Number of supports: {}", supports.len());
-    let checks = physical_supports_to_stabilizer_checks(&supports, &codes, cli.distance);
+    let checks = physical_supports_to_stabilizer_checks(&supports, &codes, cli.distance, &cli.surgery_graph_config());
     let memory = compile_memory_experiment(checks, cli.distance, &codes, cli.basis.into());
     let stim = memory.flatten().to_string();
 
