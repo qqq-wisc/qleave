@@ -224,6 +224,12 @@ struct Cli {
     /// zigzag cellulation may produce.
     #[arg(long, default_value_t = SurgeryGraphConfig::default().max_check_degree)]
     cellulation_degree: usize,
+
+    /// (to_physical) Disable the surgery-graph caches (the full-support,
+    /// per-block, and shape layers); every measurement rebuilds its graphs
+    /// from scratch.
+    #[arg(long)]
+    no_surgery_cache: bool,
 }
 
 impl Cli {
@@ -236,6 +242,7 @@ impl Cli {
             qubit_degree: self.expander_qubit_degree,
             seed: self.surgery_seed,
             max_check_degree: self.cellulation_degree,
+            caching: !self.no_surgery_cache,
         }
     }
 }

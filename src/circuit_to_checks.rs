@@ -1,5 +1,7 @@
 use crate::{
-    graph_construction::{SurgeryGraph, SurgeryGraphConfig, bridge_surgery_graphs, surgery_graph},
+    graph_construction::{
+        ShapeCache, SurgeryGraph, SurgeryGraphConfig, bridge_surgery_graphs, surgery_graph_cached,
+    },
     graph_to_checks::{CorrectionSupport, get_correction_support, graph_to_checks, operator_edge_basis},
     pbc::{
         ArchitectureQubit::{Magic, Memory, Processor}, CodePauli, CodeQubit, GraphPauli, Pauli, PauliAxis, PauliProductCircuit, PauliProductOperation, PauliString, PhysicalPauliString, PhysicalQubit, Sign, lift_code_to_merged, pauli_string_mult
@@ -7,6 +9,7 @@ use crate::{
 };
 use ndarray;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -568,25 +571,66 @@ struct BlockSurgery<'a> {
     kind: BlockKind,
 }
 
-/// Per-block surgery graphs memoized on `(kind, support)`. The other inputs to
-/// [`surgery_graph`] — the block's stabilizers and the config — are fixed for one
-/// lowering pass, and the sign never enters graph construction, so this key is
-/// exact. Keying per block (rather than per whole measurement) lets a block-side
-/// piece be reused across different partners: e.g. every T-gadget measures the
-/// same magic-block logical, so its graph is built once for the whole circuit.
-type GraphCache = HashMap<(BlockKind, PhysicalPauliString), SurgeryGraph<BlockKind>>;
+/// Two-level memoization of per-block surgery graphs, scoped to one lowering pass
+/// (the blocks' stabilizers and the config are fixed within it, and the sign never
+/// enters graph construction).
+///
+/// `exact` keys finished graphs on `(kind, support)`: per block rather than per
+/// whole measurement, so a block-side piece is reused across different partners —
+/// e.g. every T-gadget measures the same magic-block logical, whose graph is then
+/// built once for the whole circuit. Beneath it, `shape` memoizes the expensive
+/// structural stages on the support's position-space shape (see [`ShapeCache`]),
+/// catching supports that differ only by relabeling — e.g. the same gadget on a
+/// different logical qubit.
+struct SurgeryCaches {
+    exact: HashMap<(BlockKind, PhysicalPauliString), SurgeryGraph<BlockKind>>,
+    shape: ShapeCache,
+}
+
+impl SurgeryCaches {
+    fn new() -> Self {
+        Self {
+            exact: HashMap::new(),
+            shape: ShapeCache::new(),
+        }
+    }
+}
 
 /// The surgery graph for (`kind`, `support`), built on first use and cached.
 fn cached_surgery_graph<'c>(
-    cache: &'c mut GraphCache,
+    caches: &'c mut SurgeryCaches,
     stabilizers: &Vec<PhysicalPauliString>,
     support: &PhysicalPauliString,
     kind: BlockKind,
     config: &SurgeryGraphConfig,
 ) -> &'c SurgeryGraph<BlockKind> {
-    cache
-        .entry((kind, support.clone()))
-        .or_insert_with(|| surgery_graph(stabilizers, support, kind, config))
+    let SurgeryCaches { exact, shape } = caches;
+    // With caching off, rebuild unconditionally — but still store the result, so
+    // the map keeps owning the graph callers borrow (e.g. [`bridged_checks`]
+    // re-borrowing both sides after filling them).
+    if !config.caching {
+        let graph = surgery_graph_cached(stabilizers, support, kind, config, shape);
+        return match exact.entry((kind, support.clone())) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(graph);
+                entry.into_mut()
+            }
+            Entry::Vacant(entry) => entry.insert(graph),
+        };
+    }
+    match exact.entry((kind, support.clone())) {
+        Entry::Occupied(entry) => {
+            eprintln!(
+                "[surgery_graph] block cache hit! I've built this exact {kind}-block support \
+                 (weight {}) before.",
+                support.len(),
+            );
+            entry.into_mut()
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(surgery_graph_cached(stabilizers, support, kind, config, shape))
+        }
+    }
 }
 
 /// Build the merged-code checks for a support spanning the two blocks `a` and `b`:
@@ -602,15 +646,15 @@ fn bridged_checks(
     sign: Sign,
     distance: usize,
     config: &SurgeryGraphConfig,
-    graph_cache: &mut GraphCache,
+    graph_cache: &mut SurgeryCaches,
 ) -> Deformation {
     // Fill both entries first, then re-borrow immutably: the two per-block
     // graphs must be alive at once for bridging, which one `&mut` helper call
     // at a time can't provide.
     cached_surgery_graph(graph_cache, a.stabilizers, a.support, a.kind, config);
     cached_surgery_graph(graph_cache, b.stabilizers, b.support, b.kind, config);
-    let a_graph = &graph_cache[&(a.kind, a.support.clone())];
-    let b_graph = &graph_cache[&(b.kind, b.support.clone())];
+    let a_graph = &graph_cache.exact[&(a.kind, a.support.clone())];
+    let b_graph = &graph_cache.exact[&(b.kind, b.support.clone())];
     let graph = bridge_surgery_graphs(a_graph, b_graph, distance);
 
     let code_stabilizers: Vec<CodePauli<BlockKind>> = a
@@ -651,7 +695,7 @@ fn single_block_checks(
     static_stabilizers: Vec<GraphPauli<BlockKind>>,
     sign: Sign,
     config: &SurgeryGraphConfig,
-    graph_cache: &mut GraphCache,
+    graph_cache: &mut SurgeryCaches,
 ) -> Deformation {
     let graph = cached_surgery_graph(graph_cache, b.stabilizers, b.support, b.kind, config);
 
@@ -710,10 +754,11 @@ fn physical_supports_to_stabilizer_sets(
     // measure the same Pauli product many times, and surgery-graph construction
     // dominates this pass.
     let mut cache: HashMap<&PhysicalSupport, Deformation> = HashMap::new();
-    // Beneath that, per-block graphs are memoized separately (see [`GraphCache`]),
-    // so measurements that share only one side — e.g. the magic piece of every
-    // T-gadget — still reuse the expensive graph construction.
-    let mut graph_cache = GraphCache::new();
+    // Beneath that, per-block graphs are memoized separately (see
+    // [`SurgeryCaches`]), so measurements that share only one side — e.g. the
+    // magic piece of every T-gadget — still reuse the expensive graph
+    // construction, and shape-equal supports share the structural stages.
+    let mut graph_cache = SurgeryCaches::new();
 
     let mut stabilizers = Vec::new();
     for (i, support) in supports.iter().enumerate() {
@@ -722,12 +767,14 @@ fn physical_supports_to_stabilizer_sets(
             i + 1,
             supports.len()
         );
-        if let Some(hit) = cache.get(support) {
-            eprintln!(
-                "[surgery_graph] cache hit!"
-            );
-            stabilizers.push(hit.clone());
-            continue;
+        if config.caching {
+            if let Some(hit) = cache.get(support) {
+                eprintln!(
+                    "[surgery_graph] full cache hit! I've seen this exact Pauli product before."
+                );
+                stabilizers.push(hit.clone());
+                continue;
+            }
         }
         let deformation = match support.block_support() {
             BlockSupport::Single(support_ps, kind) => {
@@ -772,7 +819,9 @@ fn physical_supports_to_stabilizer_sets(
                 &mut graph_cache,
             ),
         };
-        cache.insert(support, deformation.clone());
+        if config.caching {
+            cache.insert(support, deformation.clone());
+        }
         stabilizers.push(deformation);
     }
     stabilizers

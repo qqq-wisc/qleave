@@ -4,6 +4,7 @@ use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 fn paulis_commute(p: Pauli, q: Pauli) -> bool {
@@ -58,22 +59,93 @@ pub fn surgery_graph<K: Ord + Copy>(
     block_name: K,
     config: &SurgeryGraphConfig,
 ) -> SurgeryGraph<K> {
+    surgery_graph_cached(stabilizers, operator, block_name, config, &mut ShapeCache::new())
+}
+
+/// Cellulated structural graphs memoized on the operator's position-space
+/// *shape*: its support weight plus the sorted multiset of path-matching edges
+/// (position pairs). Everything expensive in [`surgery_graph_cached`] — expander
+/// construction, thickening, cellulation — is a pure function of that shape (the
+/// RNG is reseeded from `config.seed` per build), so two operators sharing a key
+/// share the structure, even when they live on different qubits or anticommute
+/// with different stabilizers (e.g. the same logical measured on two translated
+/// qubits of a quasi-cyclic code). The key deliberately sorts away edge order:
+/// any cellulation of the same edge multiset contains every path-matching edge
+/// and its cycle checks are faces of the graph itself, so the reuse is exact,
+/// though outputs can differ from what an uncached build of the later operator
+/// would have produced (a different but equally valid surgery graph).
+///
+/// One cache is valid for one `SurgeryGraphConfig`; keep it scoped to a single
+/// lowering pass alongside the exact per-support cache.
+pub struct ShapeCache(HashMap<(usize, Vec<Edge>), Cellulation>);
+
+impl ShapeCache {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+/// [`surgery_graph`] with the structural stages memoized in `cache`; see
+/// [`ShapeCache`]. The per-operator finishing — path matchings, lifting the
+/// structural graph to a node-weighted one, port labeling — still runs per call.
+pub fn surgery_graph_cached<K: Ord + Copy>(
+    stabilizers: &Vec<PhysicalPauliString>,
+    operator: &PhysicalPauliString,
+    block_name: K,
+    config: &SurgeryGraphConfig,
+    cache: &mut ShapeCache,
+) -> SurgeryGraph<K> {
     let (path_graph, path_matching) = path_matching_graph(&stabilizers, &operator);
-    let expander =
-        build_congestion_aware_expander(&path_graph, config, &mut StdRng::seed_from_u64(config.seed));
-    let thickend = thicken(&expander);
-    let cellulated = cellulate(&thickend, config.max_check_degree);
-    eprintln!(
-        "[surgery_graph] op_weight={} base_vertices={} base_edges={} levels={} \
-         lambda2={:.3} edge-qubits={} (chords={})",
-        operator.len(),
-        thickend.base_vertices,
-        expander.graph.edge_count(),
-        thickend.levels,
-        expander.lambda2,
-        cellulated.graph.edge_count(),
-        cellulated.chords.len(),
-    );
+    // The shape key: a sorted multiset (not a set — parallel edges from two
+    // stabilizers matching the same position pair must survive) of the path
+    // graph's edges, plus its vertex count for edgeless corner cases.
+    let mut shape_edges: Vec<Edge> = path_graph
+        .edge_indices()
+        .map(|e| {
+            let (a, b) = path_graph.edge_endpoints(e).expect("edge has endpoints");
+            canonical_edge(a.index(), b.index())
+        })
+        .collect();
+    shape_edges.sort_unstable();
+    let shape_edge_count = shape_edges.len();
+    let build = || {
+        let expander = build_congestion_aware_expander(
+            &path_graph,
+            config,
+            &mut StdRng::seed_from_u64(config.seed),
+        );
+        let thickend = thicken(&expander);
+        let cellulated = cellulate(&thickend, config.max_check_degree);
+        eprintln!(
+            "[surgery_graph] op_weight={} base_vertices={} base_edges={} levels={} \
+             lambda2={:.3} edge-qubits={} (chords={})",
+            operator.len(),
+            thickend.base_vertices,
+            expander.graph.edge_count(),
+            thickend.levels,
+            expander.lambda2,
+            cellulated.graph.edge_count(),
+            cellulated.chords.len(),
+        );
+        cellulated
+    };
+    let uncached;
+    let cellulated: &Cellulation = if config.caching {
+        match cache.0.entry((path_graph.node_count(), shape_edges)) {
+            Entry::Occupied(entry) => {
+                eprintln!(
+                    "[surgery_graph] shape cache hit! op_weight={} with {shape_edge_count} \
+                     matching edges has the same position-space shape as an earlier build.",
+                    operator.len(),
+                );
+                entry.into_mut()
+            }
+            Entry::Vacant(entry) => entry.insert(build()),
+        }
+    } else {
+        uncached = build();
+        &uncached
+    };
     // The cellulated graph is unlabeled (`UnGraph<(), ()>`); lift it to carry node
     // weights, then label each port vertex with its code qubit. The ports are the
     // operator's support, vertices `0..|support|` in the order `path_matching_graph`
@@ -92,7 +164,7 @@ pub fn surgery_graph<K: Ord + Copy>(
     }
     SurgeryGraph {
         graph,
-        cycle_checks: cellulated.checks,
+        cycle_checks: cellulated.checks.clone(),
         path_matching,
     }
 }
@@ -453,6 +525,10 @@ pub struct SurgeryGraphConfig {
     /// `max_check_degree` passed to [`cellulate`]: the largest face (cycle
     /// check) degree the zigzag cellulation may produce.
     pub max_check_degree: usize,
+    /// Enables the surgery-graph caches (the full-support, per-block, and shape
+    /// layers). Off, every measurement rebuilds its graphs from scratch — useful
+    /// for timing the caches or ruling them out while debugging.
+    pub caching: bool,
 }
 
 impl Default for SurgeryGraphConfig {
@@ -469,6 +545,7 @@ impl Default for SurgeryGraphConfig {
             qubit_degree: 12,
             seed: 42,
             max_check_degree: 12,
+            caching: true,
         }
     }
 }
