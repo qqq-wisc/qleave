@@ -36,6 +36,7 @@ impl Architecture {
             "balanced-lp20" => Some(&BALANCED_LP_20),
             "balanced-lp24" => Some(&BALANCED_LP_24),
             "small" => Some(&SMALL),
+            "gross" => Some(&GROSS),
             _ => None,
         }
     }
@@ -82,3 +83,41 @@ pub const SMALL: Architecture = Architecture {
     processor_code: "bb18",
     magic_code: "bb18",
 };
+
+pub const LP_20_GROSS: Architecture = Architecture {
+    memory_capacity: 12,
+    processor_capacity: 12,
+    memory_code: "lp3_7_20",
+    processor_code: "gross",
+    magic_code: "gross",
+};
+
+pub const LP_20_2GROSS: Architecture = Architecture {
+    memory_capacity: 12,
+    processor_capacity: 12,
+    memory_code: "lp3_7_20",
+    processor_code: "two_gross",
+    magic_code: "two_gross",
+};
+
+
+// IBM gross code [[144, 12, 12]] in every block — for benchmarking single-operator
+// surgery against GeneCS (arXiv:2605.21746) Table 2, which reports 24 ancilla
+// qubits for this code.
+pub const GROSS: Architecture = Architecture {
+    memory_capacity: 12,
+    processor_capacity: 12,
+    memory_code: "gross",
+    processor_code: "gross",
+    magic_code: "gross",
+};
+
+// IBM gross code [[288, 12, 18]] in every block 
+pub const TWO_GROSS: Architecture = Architecture {
+    memory_capacity: 12,
+    processor_capacity: 12,
+    memory_code: "two_gross",
+    processor_code: "two_gross",
+    magic_code: "two_gross",
+};
+

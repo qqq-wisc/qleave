@@ -44,7 +44,7 @@ fn ppc_to_physical_circuit(
     magic_block: &CSSCodeBlock,
     distance: usize,
 ) -> Result<PhysicalCircuit<usize>, Box<dyn std::error::Error>> {
-    let codes = CodeData::from_blocks(memory_block, processor_block, magic_block)?;
+    let codes = CodeData::from_blocks(memory_block, processor_block, magic_block, usize::MAX)?;
     let supports = pauli_product_circuit_to_physical_supports(circ, &codes);
     let checks = physical_supports_to_stabilizer_checks(&supports, &codes, distance, &SurgeryGraphConfig::default());
     Ok(checks_to_physical_circuit(checks, distance).flatten())
@@ -56,7 +56,7 @@ fn logical_circuit_to_physical_circuit(
     distance: usize,
 ) -> Result<PhysicalCircuit<usize>, Box<dyn std::error::Error>> {
     let blocks = arch.css_blocks()?;
-    let codes = CodeData::from_blocks(&blocks.0, &blocks.1, &blocks.2)?;
+    let codes = CodeData::from_blocks(&blocks.0, &blocks.1, &blocks.2, usize::MAX)?;
     let ppm = compile(circ, arch.processor_capacity, false, false, false, None);
     let instructions_len = ppm.instructions.len();
     eprintln!("Number of PPM instructions: {instructions_len}");
@@ -157,7 +157,7 @@ fn memory_experiment() -> Result<(), Box<dyn std::error::Error>> {
     let circ = demo_circuit();
     let arch = Architecture::preset("small").unwrap();
     let blocks = arch.css_blocks()?;
-    let codes = CodeData::from_blocks(&blocks.0, &blocks.1, &blocks.2)?;
+    let codes = CodeData::from_blocks(&blocks.0, &blocks.1, &blocks.2, usize::MAX)?;
     let ppm = compile(circ, arch.processor_capacity, false, false, false, None);
     eprintln!("Number of PPM instructions: {}", ppm.instructions.len());
 
@@ -167,7 +167,7 @@ fn memory_experiment() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(DISTANCE);
     let supports = pauli_product_circuit_to_physical_supports(&ppm, &codes);
     let checks = physical_supports_to_stabilizer_checks(&supports, &codes, distance, &SurgeryGraphConfig::default());
-    let memory = compile_memory_experiment(checks, distance, &codes, Pauli::X);
+    let memory = compile_memory_experiment(checks, distance, &codes, Pauli::X, true);
     print!("{}", memory.flatten());
     Ok(())
 }
@@ -182,7 +182,7 @@ fn lower_ppm_to_file(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let supports = pauli_product_circuit_to_physical_supports(ppm, codes);
     let checks = physical_supports_to_stabilizer_checks(&supports, codes, distance, &SurgeryGraphConfig::default());
-    let memory = compile_memory_experiment(checks, distance, codes, Pauli::Z);
+    let memory = compile_memory_experiment(checks, distance, codes, Pauli::Z, true);
     fs::write(path, format!("{}", memory.flatten()))?;
     Ok(())
 }
@@ -199,7 +199,7 @@ fn ppm_from(measurements: Vec<Vec<(ArchitectureQubit, Pauli)>>) -> PauliProductC
 fn determinism_probe() -> Result<(), Box<dyn std::error::Error>> {
     let (memory_block, processor_block, magic_block) =
         (css_block("bb18")?, css_block("bb18")?, css_block("bb18")?);
-    let codes = CodeData::from_blocks(&memory_block, &processor_block, &magic_block)?;
+    let codes = CodeData::from_blocks(&memory_block, &processor_block, &magic_block, usize::MAX)?;
 
     let cases: Vec<(&str, PauliProductCircuit)> = vec![
         // In-block memory, commutes with all logical Z -> all readouts deterministic.

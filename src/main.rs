@@ -1,21 +1,28 @@
 use clap::{Parser, ValueEnum};
 use qleave::{
     arch::{
-        Architecture, BALANCED_LP_20, BALANCED_LP_24, SMALL, SPACE_EFFICIENT_LP_20,
-        SPACE_EFFICIENT_LP_24,
+        Architecture, BALANCED_LP_20, BALANCED_LP_24, GROSS, LP_20_2GROSS, LP_20_GROSS, SMALL,
+        SPACE_EFFICIENT_LP_20, SPACE_EFFICIENT_LP_24, TWO_GROSS,
     },
-    checks_to_physical_circuit::{compile_memory_experiment, compile_plain_memory_experiment},
+    checks_to_physical_circuit::{
+        CircuitStats, compile_memory_experiment, compile_plain_memory_experiment,
+    },
     circuit::Circuit,
     circuit_to_checks::{
         CodeData, pauli_product_circuit_to_physical_supports,
         physical_supports_to_stabilizer_checks,
     },
-    compile::{compile, compile_steps},
+    compile::{compile, compile_explicit_clifford, compile_explicit_clifford_steps, compile_steps},
     graph_construction::SurgeryGraphConfig,
     parse::parse,
     pbc::Pauli,
 };
-use std::{fs, io::{self, Write}, path::{Path, PathBuf}, process};
+use std::{
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process,
+};
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Arch {
@@ -23,8 +30,14 @@ enum Arch {
     SpaceEfficientLp24,
     BalancedLp20,
     BalancedLp24,
+    Lp20Gross,
+    Lp20TwoGross,
     /// Tiny all-`bb18` architecture for quick end-to-end tests.
     Small,
+    /// All-`gross` ([[144,12,12]]) architecture for benchmarking against GeneCS.
+    Gross,
+    /// All-`two_gross` ([[288,12,18]]) architecture for benchmarking against GeneCS.
+    TwoGross,
 }
 
 impl Arch {
@@ -34,7 +47,25 @@ impl Arch {
             Arch::SpaceEfficientLp24 => &SPACE_EFFICIENT_LP_24,
             Arch::BalancedLp20 => &BALANCED_LP_20,
             Arch::BalancedLp24 => &BALANCED_LP_24,
+            Arch::Lp20Gross => &LP_20_GROSS,
+            Arch::Lp20TwoGross => &LP_20_2GROSS,
             Arch::Small => &SMALL,
+            Arch::Gross => &GROSS,
+            Arch::TwoGross => &TWO_GROSS,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Arch::SpaceEfficientLp20 => "space_efficient_lp20",
+            Arch::SpaceEfficientLp24 => "space_efficient_lp24",
+            Arch::BalancedLp20 => "balanced_lp20",
+            Arch::BalancedLp24 => "balanced_lp24",
+            Arch::Lp20Gross => "lp20_gross",
+            Arch::Lp20TwoGross => "lp20_two_gross",
+            Arch::Small => "small",
+            Arch::Gross => "gross",
+            Arch::TwoGross => "two_gross",
         }
     }
 }
@@ -53,11 +84,13 @@ enum Mode {
     Memory,
 }
 
-/// Logical readout basis for the memory experiment.
+/// Logical readout basis for the memory experiment. Only X and Z are supported:
+/// these are CSS codes, which have no uniform-basis transversal Y readout (the
+/// logical Y is the mixed-Pauli product X_L·Z_L, with no pure-Y stabilizers to
+/// anchor the final detectors).
 #[derive(Clone, Copy, ValueEnum)]
 enum Basis {
     X,
-    Y,
     Z,
 }
 
@@ -65,7 +98,6 @@ impl From<Basis> for Pauli {
     fn from(b: Basis) -> Self {
         match b {
             Basis::X => Pauli::X,
-            Basis::Y => Pauli::Y,
             Basis::Z => Pauli::Z,
         }
     }
@@ -106,6 +138,13 @@ struct Cli {
     #[arg(long)]
     skip_redundant_ls: bool,
 
+    /// Materialize Cliffords as explicit Clifford gadgets on a magic ancilla
+    /// instead of absorbing them into the measurement frame. Produces a
+    /// measurement-only Pauli-product circuit. (`--mode compile` only.) With
+    /// --intermediates, also writes pbc_explicit_clifford.txt.
+    #[arg(long)]
+    explicit_clifford: bool,
+
     /// Use SAT-based optimal partitioner (max_k and initial bound learned from greedy).
     /// Implies --skip-redundant-ls (required for Belady's optimality guarantee).
     #[arg(long)]
@@ -129,6 +168,32 @@ struct Cli {
     /// (to_physical) Logical basis the memory experiment reads out.
     #[arg(long, value_enum, default_value_t = Basis::Z)]
     basis: Basis,
+
+    /// (to_physical / memory) Lower MPP syndrome measurements to an ancilla-based,
+    /// TICK-layered syndrome-extraction circuit (no noise injected).
+    #[arg(long)]
+    syndrome_extraction_circuits: bool,
+
+    /// (to_physical / memory) Skip the transversal readout, logical-observable and
+    /// final-detector pass (the stabilizer-frame solve). Produces a circuit with no
+    /// observables — useful for profiling, since the solve dominates compile time.
+    #[arg(long)]
+    no_memory_observables: bool,
+
+    /// (to_physical / memory) Run qldpc's BP+OSD logical-operator weight reduction
+    /// only on code blocks with at most this many physical qubits. Reduction lowers
+    /// logical weight (cheaper surgery) but its cost explodes with code size: the
+    /// small processor/magic blocks reduce in seconds, while the large memory codes
+    /// (lp3_7_20, 4350 qubits) take >10 min. The default reduces the former and skips
+    /// the latter; all results are cached. Set 0 to skip reduction entirely, or a
+    /// large value to reduce every block.
+    #[arg(long, default_value_t = 2000)]
+    logical_operator_reduction_threshold: usize,
+
+    /// (to_physical / memory) Write a JSON stats record (architecture, surgery-graph
+    /// config, rounds, per-type qubit counts, syndrome cycles, SEC depth) to this path.
+    #[arg(long)]
+    stats: Option<PathBuf>,
 
     /// (to_physical) Number of randomized congestion-aware expander
     /// constructions to try per surgery graph; the smallest result is kept.
@@ -195,7 +260,10 @@ fn main() {
         }
         None => match cli.mem_cap {
             Some(mem) => (mem, cli.proc_cap.unwrap()),
-            None => (SPACE_EFFICIENT_LP_20.memory_capacity, SPACE_EFFICIENT_LP_20.processor_capacity),
+            None => (
+                SPACE_EFFICIENT_LP_20.memory_capacity,
+                SPACE_EFFICIENT_LP_20.processor_capacity,
+            ),
         },
     };
 
@@ -235,23 +303,48 @@ fn main() {
         }
     });
 
+    // If using SAT, we must skip redundant load/stores to guarantee optimality (Belady's algorithm)
+    let skip_redundant = cli.skip_redundant_ls || cli.sat;
+
     let pbc_final = if let Some(dir) = intermediates_dir {
         fs::create_dir_all(&dir).unwrap_or_else(|e| {
             eprintln!("error creating intermediates dir: {e}");
             process::exit(1);
         });
-        let (load_store, pbc_pre, pbc_final) = compile_steps(
-            circuit,
-            proc_cap,
-            cli.simulate_corrections,
-            cli.skip_redundant_ls || cli.sat, // If using SAT, we must skip redundant load/stores to guarantee optimality (Belady's algorithm)
-            cli.sat,
-            cli.sat_timeout,
-        );
-        let writes = [
-            ("load_store.txt", load_store.to_string()),
-            ("pbc_w_clifford.txt", pbc_pre.to_string()),
-        ];
+        let (writes, pbc_final) = if cli.explicit_clifford {
+            let (load_store, pbc_pre, explicit, pbc_final) = compile_explicit_clifford_steps(
+                circuit,
+                proc_cap,
+                cli.simulate_corrections,
+                skip_redundant,
+                cli.sat,
+                cli.sat_timeout,
+            );
+            (
+                vec![
+                    ("load_store.txt", load_store.to_string()),
+                    ("pbc_w_clifford.txt", pbc_pre.to_string()),
+                    ("pbc_explicit_clifford.txt", explicit.to_string()),
+                ],
+                pbc_final,
+            )
+        } else {
+            let (load_store, pbc_pre, pbc_final) = compile_steps(
+                circuit,
+                proc_cap,
+                cli.simulate_corrections,
+                skip_redundant,
+                cli.sat,
+                cli.sat_timeout,
+            );
+            (
+                vec![
+                    ("load_store.txt", load_store.to_string()),
+                    ("pbc_w_clifford.txt", pbc_pre.to_string()),
+                ],
+                pbc_final,
+            )
+        };
         for (name, content) in writes {
             fs::write(dir.join(name), content).unwrap_or_else(|e| {
                 eprintln!("error writing {name}: {e}");
@@ -260,12 +353,21 @@ fn main() {
         }
         eprintln!("intermediates written to {}/", dir.display());
         pbc_final
+    } else if cli.explicit_clifford {
+        compile_explicit_clifford(
+            circuit,
+            proc_cap,
+            cli.simulate_corrections,
+            skip_redundant,
+            cli.sat,
+            cli.sat_timeout,
+        )
     } else {
         compile(
             circuit,
             proc_cap,
             cli.simulate_corrections,
-            cli.skip_redundant_ls || cli.sat, // If using SAT, we must skip redundant load/stores to guarantee optimality (Belady's algorithm)
+            skip_redundant,
             cli.sat,
             cli.sat_timeout,
         )
@@ -308,26 +410,63 @@ fn run_to_physical(cli: &Cli, circuit_path: &Path, circuit: Circuit) {
         eprintln!("error building css blocks: {e}");
         process::exit(1);
     });
-    let codes = CodeData::from_blocks(&blocks.0, &blocks.1, &blocks.2).unwrap_or_else(|e| {
+    let codes = CodeData::from_blocks(
+        &blocks.0,
+        &blocks.1,
+        &blocks.2,
+        cli.logical_operator_reduction_threshold,
+    )
+    .unwrap_or_else(|e| {
         eprintln!("error building code data: {e}");
         process::exit(1);
     });
 
-    let ppm = compile(
-        circuit,
-        arch.processor_capacity,
-        cli.simulate_corrections,
-        cli.skip_redundant_ls || cli.sat,
-        cli.sat,
-        cli.sat_timeout,
-    );
+    let ppm = if cli.explicit_clifford {
+        compile_explicit_clifford(
+            circuit,
+            arch.processor_capacity,
+            cli.simulate_corrections,
+            cli.skip_redundant_ls || cli.sat,
+            cli.sat,
+            cli.sat_timeout,
+        )
+    } else {
+        compile(
+            circuit,
+            arch.processor_capacity,
+            cli.simulate_corrections,
+            cli.skip_redundant_ls || cli.sat,
+            cli.sat,
+            cli.sat_timeout,
+        )
+    };
     eprintln!("Number of PPM instructions: {}", ppm.instructions.len());
 
     let supports = pauli_product_circuit_to_physical_supports(&ppm, &codes);
     eprintln!("Number of supports: {}", supports.len());
-    let checks = physical_supports_to_stabilizer_checks(&supports, &codes, cli.distance, &cli.surgery_graph_config());
-    let memory = compile_memory_experiment(checks, cli.distance, &codes, cli.basis.into());
-    let stim = memory.flatten().to_string();
+    let checks = physical_supports_to_stabilizer_checks(
+        &supports,
+        &codes,
+        cli.distance,
+        &cli.surgery_graph_config(),
+    );
+    let memory = compile_memory_experiment(
+        checks,
+        cli.distance,
+        &codes,
+        cli.basis.into(),
+        !cli.no_memory_observables,
+    );
+    if let Some(path) = &cli.stats {
+        write_stats(path, cli, memory.stats());
+    }
+    let physical = memory.flatten();
+    let physical = if cli.syndrome_extraction_circuits {
+        physical.expand_mpp_to_sec()
+    } else {
+        physical
+    };
+    let stim = physical.to_string();
 
     let output_path = cli.output.clone().unwrap_or_else(|| {
         let stem = circuit_path.file_stem().unwrap_or_default();
@@ -353,6 +492,58 @@ fn run_to_physical(cli: &Cli, circuit_path: &Path, circuit: Circuit) {
     }
 }
 
+/// Write a `--stats` JSON record: the architecture, the surgery-graph config, the
+/// round count, the per-type qubit counts, and the syndrome-cycle / SEC-depth
+/// metrics. The ancilla count is the SEC pool only when `--syndrome-extraction-circuits`
+/// is set (the MPP form uses no ancillas), otherwise 0.
+fn write_stats(path: &Path, cli: &Cli, stats: CircuitStats) {
+    let arch = cli.arch.map(Arch::name).unwrap_or("small");
+    let c = cli.surgery_graph_config();
+    let ancilla = if cli.syndrome_extraction_circuits {
+        stats.sec_ancilla_pool
+    } else {
+        0
+    };
+    let total = stats.code_qubits + stats.edge_qubits + ancilla;
+    let json = format!(
+        "{{\n  \"arch\": \"{arch}\",\n  \"rounds\": {rounds},\n  \
+         \"config\": {{\n    \
+         \"expander_trials\": {trials},\n    \
+         \"expander_reset_period\": {reset_period},\n    \
+         \"expander_max_iterations\": {max_iterations},\n    \
+         \"expander_qubit_degree\": {qubit_degree},\n    \
+         \"surgery_seed\": {seed},\n    \
+         \"cellulation_degree\": {max_check_degree}\n  }},\n  \
+         \"qubits\": {{\n    \
+         \"code\": {code},\n    \
+         \"edge\": {edge},\n    \
+         \"ancilla\": {ancilla},\n    \
+         \"total\": {total}\n  }},\n  \
+         \"syndrome_cycles\": {cycles},\n  \
+         \"sec_depth\": {depth}\n}}\n",
+        rounds = cli.distance,
+        trials = c.trials,
+        reset_period = c.reset_period,
+        max_iterations = c.max_iterations,
+        qubit_degree = c.qubit_degree,
+        seed = c.seed,
+        max_check_degree = c.max_check_degree,
+        code = stats.code_qubits,
+        edge = stats.edge_qubits,
+        cycles = stats.syndrome_cycles,
+        depth = stats.sec_depth,
+    );
+    if path == Path::new("-") {
+        print!("{json}");
+    } else {
+        fs::write(path, &json).unwrap_or_else(|e| {
+            eprintln!("error writing stats to {}: {e}", path.display());
+            process::exit(1);
+        });
+        eprintln!("Wrote stats to {}", path.display());
+    }
+}
+
 /// `--mode memory`: emit a plain (surgery-free) memory experiment for the chosen
 /// architecture — the bare code idling for `--distance` rounds then transversal
 /// `--basis` readout. The QASM input is ignored. A distance-debugging baseline.
@@ -367,15 +558,38 @@ fn run_plain_memory(cli: &Cli) {
         eprintln!("error building css blocks: {e}");
         process::exit(1);
     });
-    let codes = CodeData::from_blocks(&blocks.0, &blocks.1, &blocks.2).unwrap_or_else(|e| {
+    let codes = CodeData::from_blocks(
+        &blocks.0,
+        &blocks.1,
+        &blocks.2,
+        cli.logical_operator_reduction_threshold,
+    )
+    .unwrap_or_else(|e| {
         eprintln!("error building code data: {e}");
         process::exit(1);
     });
 
-    let memory = compile_plain_memory_experiment(&codes, cli.distance, cli.basis.into());
-    let stim = memory.flatten().to_string();
+    let memory = compile_plain_memory_experiment(
+        &codes,
+        cli.distance,
+        cli.basis.into(),
+        !cli.no_memory_observables,
+    );
+    if let Some(path) = &cli.stats {
+        write_stats(path, cli, memory.stats());
+    }
+    let physical = memory.flatten();
+    let physical = if cli.syndrome_extraction_circuits {
+        physical.expand_mpp_to_sec()
+    } else {
+        physical
+    };
+    let stim = physical.to_string();
 
-    let output_path = cli.output.clone().unwrap_or_else(|| PathBuf::from("memory.stim"));
+    let output_path = cli
+        .output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("memory.stim"));
     if output_path == Path::new("-") {
         let stdout = io::stdout();
         let mut h = stdout.lock();

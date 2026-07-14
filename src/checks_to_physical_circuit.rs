@@ -55,6 +55,310 @@ impl<Q: PauliStringIndex> PhysicalCircuit<Q> {
     }
 }
 
+/// Per-type qubit counts and depth metrics of a compiled physical circuit, for
+/// `--stats`. Computed off the [`MergedQubit`] circuit (before `flatten`), so the
+/// code-qubit / edge-qubit distinction is still available.
+pub struct CircuitStats {
+    /// Distinct code qubits ([`MergedCodeQubit::CodeQubit`]) the circuit touches.
+    pub code_qubits: usize,
+    /// Distinct edge / bridge qubits ([`MergedCodeQubit::EdgeQubit`]) the circuit touches.
+    pub edge_qubits: usize,
+    /// Syndrome-extraction ancilla pool size = the widest syndrome round (one
+    /// measurement ancilla per check, reset and reused each round). This is what
+    /// [`PhysicalCircuit::expand_mpp_to_sec`] allocates; it is only physically
+    /// present when the SEC gadget is actually emitted.
+    pub sec_ancilla_pool: usize,
+    /// Number of stabilizer-measurement rounds across the whole circuit, with
+    /// `REPEAT` bodies counted by their repeat factor.
+    pub syndrome_cycles: usize,
+    /// Total `TICK` layers once every syndrome round is lowered to the ancilla SEC
+    /// gadget, with `REPEAT` bodies counted by their repeat factor.
+    pub sec_depth: usize,
+}
+
+impl PhysicalCircuit<MergedQubit> {
+    /// Summarize the circuit for `--stats`: per-type qubit counts, syndrome-round
+    /// count, and the SEC (ancilla-gadget) depth. See [`CircuitStats`].
+    pub fn stats(&self) -> CircuitStats {
+        let mut qubits = std::collections::BTreeSet::new();
+        collect_merged_qubits(&self.gates, &mut qubits);
+        let (mut code_qubits, mut edge_qubits) = (0, 0);
+        for q in &qubits {
+            match q {
+                MergedCodeQubit::EdgeQubit(_) => edge_qubits += 1,
+                MergedCodeQubit::CodeQubit { .. } => code_qubits += 1,
+            }
+        }
+        let sec = self.flatten().expand_mpp_to_sec();
+        CircuitStats {
+            code_qubits,
+            edge_qubits,
+            sec_ancilla_pool: widest_syndrome_round(&self.gates),
+            syndrome_cycles: count_syndrome_rounds(&self.gates),
+            sec_depth: count_ticks(&sec.gates),
+        }
+    }
+}
+
+/// Collect every distinct merged-code qubit any gate touches (recursing into
+/// `REPEAT` bodies).
+fn collect_merged_qubits(
+    gates: &[PhysicalGate<MergedQubit>],
+    out: &mut std::collections::BTreeSet<MergedQubit>,
+) {
+    for g in gates {
+        match g {
+            PhysicalGate::Reset(_, q)
+            | PhysicalGate::Measure(_, q, _)
+            | PhysicalGate::XCorrection(_, q) => {
+                out.insert(*q);
+            }
+            PhysicalGate::Controlled(_, c, t) => {
+                out.insert(*c);
+                out.insert(*t);
+            }
+            PhysicalGate::MPP(p) => out.extend(p.pauli_string.iter().map(|&(q, _)| q)),
+            PhysicalGate::Repeat(_, body) => collect_merged_qubits(body, out),
+            _ => {}
+        }
+    }
+}
+
+/// Number of stabilizer-measurement rounds: each maximal run of consecutive `MPP`
+/// gates is one round; a `REPEAT(n)` block contributes `n` times its body's rounds.
+fn count_syndrome_rounds<Q>(gates: &[PhysicalGate<Q>]) -> usize {
+    let mut rounds = 0;
+    let mut in_round = false;
+    for g in gates {
+        match g {
+            PhysicalGate::MPP(_) => {
+                if !in_round {
+                    rounds += 1;
+                    in_round = true;
+                }
+            }
+            PhysicalGate::Repeat(n, body) => {
+                in_round = false;
+                rounds += n * count_syndrome_rounds(body);
+            }
+            _ => in_round = false,
+        }
+    }
+    rounds
+}
+
+/// The largest number of checks in any single syndrome round (a maximal run of
+/// consecutive `MPP` gates), recursing into `REPEAT` bodies. Equals the SEC ancilla
+/// pool size — one ancilla per check of the widest round, reused each round.
+fn widest_syndrome_round<Q>(gates: &[PhysicalGate<Q>]) -> usize {
+    let mut max = 0;
+    let mut cur = 0;
+    for g in gates {
+        match g {
+            PhysicalGate::MPP(_) => {
+                cur += 1;
+                max = max.max(cur);
+            }
+            PhysicalGate::Repeat(_, body) => {
+                cur = 0;
+                max = max.max(widest_syndrome_round(body));
+            }
+            _ => cur = 0,
+        }
+    }
+    max
+}
+
+/// Number of `TICK` gates (timing layers), with `REPEAT(n)` bodies counted `n` times.
+fn count_ticks<Q>(gates: &[PhysicalGate<Q>]) -> usize {
+    gates
+        .iter()
+        .map(|g| match g {
+            PhysicalGate::Tick => 1,
+            PhysicalGate::Repeat(n, body) => n * count_ticks(body),
+            _ => 0,
+        })
+        .sum()
+}
+
+impl PhysicalCircuit<usize> {
+    /// Lower every `MPP` syndrome measurement to an ancilla-based, TICK-layered
+    /// syndrome-extraction gadget, leaving every other gate (and the entire
+    /// measurement-record stream) untouched. Each `MPP` over sites `(q_i, P_i)` becomes
+    /// `RX a` / `C{P_i} a q_i` / `MX a` on a fresh measurement ancilla `a`, which
+    /// produces exactly the one record `MPP` would have — so all downstream `rec[-k]`
+    /// offsets, detectors and observables remain valid without change. A negative-sign
+    /// check inverts its ancilla readout (`MX !a`).
+    ///
+    /// Run **after** [`PhysicalCircuit::flatten`]: data qubits occupy `0..n`, so ancillas
+    /// are allocated from a reused pool `n..n+pool_size` where `pool_size` is the widest
+    /// syndrome round. The j-th check of *every* round uses ancilla `n + j` — one
+    /// dedicated ancilla per check slot, reset and reused each round (and shared by the
+    /// `REPEAT` body and the reference round). Within a round the *checks* are greedily
+    /// colored — checks sharing a data qubit get different colors — and each color class
+    /// (mutually qubit-disjoint checks) runs in lockstep, one class after another. Every
+    /// data qubit is therefore touched at most once per TICK layer; depth is the sum over
+    /// color classes of the largest check weight in the class.
+    ///
+    /// The check coloring is required for *correctness*, not just physical layering: the
+    /// single-ancilla gadget cancels its spurious ancilla–ancilla `CZ` hooks only when
+    /// each check's controlled-Paulis stay contiguous relative to any check it shares a
+    /// qubit with (two commuting CSS checks overlap on an even number of qubits, so the
+    /// kickbacks cancel in pairs). Disjoint checks (same class) carry no hooks and may run
+    /// concurrently; shared-qubit checks fall in different classes and so run in disjoint,
+    /// sequential time spans. The resulting layers double as the *physical* gate cycles
+    /// for a downstream circuit-level noise model — this pass injects no noise. NOTE: one
+    /// ancilla per check with a serial CNOT chain is the textbook parity gadget and is
+    /// *not necessarily distance-optimal* under that noise (hook-error orientation / flag
+    /// qubits would be the refinement); that is out of scope here.
+    pub fn expand_mpp_to_sec(&self) -> PhysicalCircuit<usize> {
+        let base = max_qubit(&self.gates).map_or(0, |m| m + 1);
+        PhysicalCircuit { gates: expand_gates(&self.gates, base) }
+    }
+}
+
+/// The largest flat qubit id any gate touches (recursing into `REPEAT` bodies), or
+/// `None` for a qubit-free circuit. The ancilla pool starts one past this.
+fn max_qubit(gates: &[PhysicalGate<usize>]) -> Option<usize> {
+    fn bump(max: &mut Option<usize>, q: usize) {
+        *max = Some(max.map_or(q, |m| m.max(q)));
+    }
+    let mut max = None;
+    for g in gates {
+        match g {
+            PhysicalGate::Reset(_, q)
+            | PhysicalGate::Measure(_, q, _)
+            | PhysicalGate::XCorrection(_, q) => bump(&mut max, *q),
+            PhysicalGate::Controlled(_, c, t) => {
+                bump(&mut max, *c);
+                bump(&mut max, *t);
+            }
+            PhysicalGate::MPP(p) => {
+                for &(q, _) in p.pauli_string.iter() {
+                    bump(&mut max, q);
+                }
+            }
+            PhysicalGate::Repeat(_, body) => {
+                if let Some(m) = max_qubit(body) {
+                    bump(&mut max, m);
+                }
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
+/// Expand the `MPP`s in a flat gate list, recursing into `REPEAT` bodies (which reuse
+/// the same ancilla pool `base..`). Consecutive `MPP`s form one syndrome round; any
+/// other gate flushes the pending round and is emitted unchanged.
+fn expand_gates(gates: &[PhysicalGate<usize>], base: usize) -> Vec<PhysicalGate<usize>> {
+    let mut out = Vec::new();
+    let mut round: Vec<&PauliAxis<usize>> = Vec::new();
+    for g in gates {
+        match g {
+            PhysicalGate::MPP(p) => round.push(p),
+            other => {
+                if !round.is_empty() {
+                    emit_round(&round, base, &mut out);
+                    round.clear();
+                }
+                match other {
+                    PhysicalGate::Repeat(n, body) => {
+                        out.push(PhysicalGate::Repeat(*n, expand_gates(body, base)));
+                    }
+                    g => out.push(g.clone()),
+                }
+            }
+        }
+    }
+    if !round.is_empty() {
+        emit_round(&round, base, &mut out);
+    }
+    out
+}
+
+/// Emit one syndrome round of `checks` as TICK-layered ancilla gadgets: a reset layer
+/// (`RX` on each check's ancilla), the edge-colored controlled-Pauli layers, then a
+/// measure layer (`MX`, inverted for a negative-sign check). The j-th check uses ancilla
+/// `base + j`; measurements are emitted in check order, preserving the record stream.
+fn emit_round(checks: &[&PauliAxis<usize>], base: usize, out: &mut Vec<PhysicalGate<usize>>) {
+    let m = checks.len();
+
+    // Reset layer.
+    for j in 0..m {
+        out.push(PhysicalGate::Reset(Pauli::X, base + j));
+    }
+    out.push(PhysicalGate::Tick);
+
+    // Greedy *check* coloring: checks sharing a data qubit get different colors, so each
+    // color class is a set of mutually qubit-disjoint checks. We must color checks (not
+    // individual gates): hook cancellation requires every check's controlled-Paulis to
+    // stay *contiguous* relative to any check it shares a qubit with. Two commuting CSS
+    // checks overlap on an even number of qubits, so when A's gates are all-before (or
+    // all-after) B's the two `Z`-kickbacks onto B's ancilla cancel; interleaving A and B
+    // on a shared qubit leaves one kickback and corrupts the measurement. Disjoint checks
+    // (same class) never share a qubit, so they may run concurrently; shared-qubit checks
+    // land in different classes and so run in disjoint, sequential time spans.
+    let mut color = vec![0usize; m];
+    let mut qubit_colors: std::collections::HashMap<usize, std::collections::HashSet<usize>> =
+        std::collections::HashMap::new();
+    for (j, check) in checks.iter().enumerate() {
+        let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for &(q, p) in check.pauli_string.iter() {
+            if p != Pauli::I {
+                if let Some(cs) = qubit_colors.get(&q) {
+                    used.extend(cs.iter().copied());
+                }
+            }
+        }
+        let mut c = 0;
+        while used.contains(&c) {
+            c += 1;
+        }
+        color[j] = c;
+        for &(q, p) in check.pauli_string.iter() {
+            if p != Pauli::I {
+                qubit_colors.entry(q).or_default().insert(c);
+            }
+        }
+    }
+    let num_colors = color.iter().copied().max().map_or(0, |c| c + 1);
+
+    // Emit one color class at a time (sequential, keeping shared-qubit checks contiguous);
+    // within a class the qubit-disjoint checks run in lockstep — at step `k`, each member
+    // emits its `k`-th controlled-Pauli, so every data qubit is touched at most once per
+    // TICK layer.
+    for c in 0..num_colors {
+        let members: Vec<usize> = (0..m).filter(|&j| color[j] == c).collect();
+        let max_weight = members
+            .iter()
+            .map(|&j| checks[j].pauli_string.iter().filter(|&&(_, p)| p != Pauli::I).count())
+            .max()
+            .unwrap_or(0);
+        for k in 0..max_weight {
+            for &j in &members {
+                let sites = checks[j].pauli_string.iter().filter(|&&(_, p)| p != Pauli::I);
+                if let Some(&(q, p)) = sites.clone().nth(k) {
+                    out.push(PhysicalGate::Controlled(p, base + j, q));
+                }
+            }
+            out.push(PhysicalGate::Tick);
+        }
+    }
+
+    // Measure layer.
+    for (j, check) in checks.iter().enumerate() {
+        debug_assert!(
+            matches!(check.sign, Sign::One | Sign::NegOne),
+            "non-Hermitian sign on a syndrome MPP"
+        );
+        let invert = check.sign == Sign::NegOne;
+        out.push(PhysicalGate::Measure(Pauli::X, base + j, invert));
+    }
+    out.push(PhysicalGate::Tick);
+}
+
 /// Lower a single gate to its flat-qubit form, threading `intern` through so the
 /// `REPEAT` body shares the same qubit numbering as the surrounding circuit.
 fn flatten_gate<Q: PauliStringIndex>(
@@ -63,7 +367,15 @@ fn flatten_gate<Q: PauliStringIndex>(
 ) -> PhysicalGate<usize> {
     match gate {
         PhysicalGate::Reset(basis, q) => PhysicalGate::Reset(*basis, intern(*q)),
-        PhysicalGate::Measure(basis, q) => PhysicalGate::Measure(*basis, intern(*q)),
+        PhysicalGate::Measure(basis, q, invert) => {
+            PhysicalGate::Measure(*basis, intern(*q), *invert)
+        }
+        PhysicalGate::Controlled(p, c, t) => {
+            // Intern the control before the target to keep numbering deterministic.
+            let c = intern(*c);
+            PhysicalGate::Controlled(*p, c, intern(*t))
+        }
+        PhysicalGate::Tick => PhysicalGate::Tick,
         PhysicalGate::XCorrection(rec, q) => PhysicalGate::XCorrection(*rec, intern(*q)),
         PhysicalGate::DeclareObservable(index, recs) => {
             PhysicalGate::DeclareObservable(*index, recs.clone())
@@ -109,14 +421,30 @@ fn write_gates<Q: std::fmt::Display + PauliStringIndex>(
                 }
                 writeln!(f)?;
             }
-            PhysicalGate::Measure(basis, _) => {
+            PhysicalGate::Measure(basis, _, _) => {
                 let basis = *basis;
                 write!(f, "{indent}M{basis}")?;
-                while let Some(PhysicalGate::Measure(b, q)) = gates.get(i) {
+                while let Some(PhysicalGate::Measure(b, q, invert)) = gates.get(i) {
                     if *b != basis {
                         break;
                     }
-                    write!(f, " {q}")?;
+                    if *invert {
+                        write!(f, " !{q}")?;
+                    } else {
+                        write!(f, " {q}")?;
+                    }
+                    i += 1;
+                }
+                writeln!(f)?;
+            }
+            PhysicalGate::Controlled(pauli, _, _) => {
+                let pauli = *pauli;
+                write!(f, "{indent}C{pauli}")?;
+                while let Some(PhysicalGate::Controlled(p, c, t)) = gates.get(i) {
+                    if *p != pauli {
+                        break;
+                    }
+                    write!(f, " {c} {t}")?;
                     i += 1;
                 }
                 writeln!(f)?;
@@ -156,7 +484,15 @@ impl<Q: std::fmt::Display + PauliStringIndex> std::fmt::Display for PhysicalGate
         };
         match self {
             PhysicalGate::Reset(basis, q) => write!(f, "R{basis} {q}"),
-            PhysicalGate::Measure(basis, q) => write!(f, "M{basis} {q}"),
+            PhysicalGate::Measure(basis, q, invert) => {
+                if *invert {
+                    write!(f, "M{basis} !{q}")
+                } else {
+                    write!(f, "M{basis} {q}")
+                }
+            }
+            PhysicalGate::Controlled(pauli, c, t) => write!(f, "C{pauli} {c} {t}"),
+            PhysicalGate::Tick => write!(f, "TICK"),
             PhysicalGate::XCorrection(rec, q) => write!(f, "CNOT rec[-{rec}] {q}"),
             PhysicalGate::DeclareObservable(index, recs) => {
                 write!(f, "OBSERVABLE_INCLUDE({index})")?;
@@ -207,12 +543,21 @@ enum PhysicalGate<Q> {
     /// stim's `RX` / `RY` / `RZ` (`Z` is the usual `|0>`).
     Reset(Pauli, Q),
     /// A single-qubit measurement in the given Pauli basis, lowered to stim's
-    /// `MX` / `MY` / `MZ`.
-    Measure(Pauli, Q),
+    /// `MX` / `MY` / `MZ`. The `bool` inverts the recorded outcome (stim's `M_ !q`),
+    /// used by the ancilla syndrome gadget to realize a negative-sign check.
+    Measure(Pauli, Q, bool),
     XCorrection(usize, Q),
     DeclareObservable(usize, Vec<usize>),
     DeclareDetector(Vec<usize>),
     MPP(PauliAxis<Q>),
+    /// A qubit-controlled Pauli (control, then target), lowered to stim's
+    /// `CX` / `CY` / `CZ`. Emitted by the ancilla syndrome gadget to entangle a
+    /// measurement ancilla (control) with a data qubit (target). Distinct from
+    /// [`PhysicalGate::XCorrection`], which is *record*-controlled.
+    Controlled(Pauli, Q, Q),
+    /// A stim `TICK`: a timing-layer boundary. Carries no qubits and no records;
+    /// emitted by the ancilla syndrome gadget to delimit physical gate layers.
+    Tick,
     /// A stim `REPEAT n { .. }` block. The body is emitted `n` times; rec offsets
     /// inside it count relative to the running measurement count, so the same body
     /// works on every iteration (and reaches back into the round emitted just
@@ -333,7 +678,7 @@ fn split_and_correct(
         .collect();
     let mut gates: Vec<PhysicalGate<MergedQubit>> = edge_qubits
         .iter()
-        .map(|e| PhysicalGate::Measure(Pauli::Z, *e))
+        .map(|e| PhysicalGate::Measure(Pauli::Z, *e, false))
         .collect();
     for CorrectionSupport { qubit, path } in corrections.iter() {
         for (i, edge_qubit) in edge_qubits.iter().enumerate() {
@@ -364,7 +709,14 @@ pub fn compile_memory_experiment(
     rounds: usize,
     code: &CodeData,
     basis: Pauli,
+    add_observables: bool,
 ) -> PhysicalCircuit<MergedQubit> {
+    // The transversal readout, observables and final detectors come from a
+    // stabilizer-frame solve that dominates compile time; skip it when the caller
+    // only wants the bare syndrome circuit.
+    if !add_observables {
+        return checks_to_physical_circuit(checks, rounds);
+    }
     // Single-round build for the determinism solve, deep build for output.
     let single = checks_to_physical_circuit(checks.clone(), 1);
     let deep = checks_to_physical_circuit(checks, rounds);
@@ -376,18 +728,21 @@ pub fn compile_memory_experiment(
 /// operations, no code surgery, no deformations. This is the surgery-free baseline
 /// for debugging: it exercises only the round-over-round and final-readout
 /// detectors, so its circuit distance should track the code distance directly
-/// (unlike [`compile_memory_experiment`], whose surgery measurements are not yet
-/// fully detector-covered). See `scripts/diagnose_distance.py`.
 pub fn compile_plain_memory_experiment(
     code: &CodeData,
     rounds: usize,
     basis: Pauli,
+    add_observables: bool,
 ) -> PhysicalCircuit<MergedQubit> {
     // Empty supports => no deformations; we only want the lifted base checks.
     let base_checks =
         physical_supports_to_stabilizer_checks(&[], code, 1, &SurgeryGraphConfig::default()).base_checks;
-    let single = plain_memory_rounds(&base_checks, 1, basis);
     let deep = plain_memory_rounds(&base_checks, rounds, basis);
+    // The readout/observable/detector pass is the expensive stabilizer-frame solve.
+    if !add_observables {
+        return deep;
+    }
+    let single = plain_memory_rounds(&base_checks, 1, basis);
     append_memory_readout(&single, deep, code, basis)
 }
 
@@ -469,7 +824,7 @@ fn append_memory_readout(
     let mut rec_abs: BTreeMap<MergedQubit, usize> = BTreeMap::new();
     for (i, &q) in readout_qubits.iter().enumerate() {
         rec_abs.insert(q, pre_readout + i);
-        gates.push(PhysicalGate::Measure(basis, q));
+        gates.push(PhysicalGate::Measure(basis, q, false));
     }
     let running = pre_readout + readout_qubits.len();
 
@@ -505,7 +860,7 @@ fn measurement_count<Q>(gates: &[PhysicalGate<Q>]) -> usize {
     gates
         .iter()
         .map(|g| match g {
-            PhysicalGate::MPP(_) | PhysicalGate::Measure(_, _) => 1,
+            PhysicalGate::MPP(_) | PhysicalGate::Measure(_, _, _) => 1,
             PhysicalGate::Repeat(n, body) => n * measurement_count(body),
             _ => 0,
         })
@@ -532,7 +887,7 @@ fn record_map<Q>(single: &PhysicalCircuit<Q>, deep: &PhysicalCircuit<Q>) -> Vec<
             _ => {
                 let s = single_iter.next().expect("single circuit shorter than deep");
                 match s {
-                    PhysicalGate::MPP(_) | PhysicalGate::Measure(_, _) => {
+                    PhysicalGate::MPP(_) | PhysicalGate::Measure(_, _, _) => {
                         map.push(m_deep);
                         m_deep += 1;
                     }
@@ -778,8 +1133,12 @@ fn solve_memory_observables(
         for g in gates {
             match g {
                 PhysicalGate::Reset(_, q)
-                | PhysicalGate::Measure(_, q)
+                | PhysicalGate::Measure(_, q, _)
                 | PhysicalGate::XCorrection(_, q) => out.push(*q),
+                PhysicalGate::Controlled(_, c, t) => {
+                    out.push(*c);
+                    out.push(*t);
+                }
                 PhysicalGate::MPP(p) => out.extend(p.pauli_string.iter().map(|&(q, _)| q)),
                 PhysicalGate::Repeat(_, body) => collect_qubits(body, out),
                 _ => {}
@@ -821,7 +1180,7 @@ fn solve_memory_observables(
     for g in &circuit.gates {
         match g {
             PhysicalGate::Reset(basis, q) => sim.reset(*basis, index[q]),
-            PhysicalGate::Measure(pauli, q) => {
+            PhysicalGate::Measure(pauli, q, _) => {
                 let (x, z) = pauli_vecs(&[(*q, *pauli)], &index);
                 sim.measure(&x, &z);
                 measure_rids.push(measured);

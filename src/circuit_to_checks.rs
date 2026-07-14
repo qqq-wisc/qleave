@@ -7,6 +7,7 @@ use crate::{
 };
 use ndarray;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 #[derive(Clone)]
@@ -64,7 +65,7 @@ const LOGICAL_BASIS_PY: &str = include_str!("get_logical_basis.py");
 /// `n..2n` Z-type — whose rows we fold into one [`PhysicalPauliString`] each
 /// (`X`/`Z`/`Y`/`I` per qubit). The interpreter is taken from `$QLDPC_PYTHON`
 /// (default `python3`); that environment must have `qldpc` installed.
-fn get_logical_basis(block: &CSSCodeBlock) -> io::Result<Vec<PhysicalPauliString>> {
+fn get_logical_basis(block: &CSSCodeBlock, reduce: bool) -> io::Result<Vec<PhysicalPauliString>> {
     let CSSCodeBlock { hx, hz } = block;
     debug_assert_eq!(
         hx.ncols(),
@@ -72,7 +73,11 @@ fn get_logical_basis(block: &CSSCodeBlock) -> io::Result<Vec<PhysicalPauliString
         "hx and hz must act on the same number of physical qubits",
     );
 
+    // The leading flag tells the helper whether to run qldpc's BP+OSD weight
+    // reduction (the multi-minute step on large memory codes); it is also part
+    // of the cache key, so reduced and unreduced bases never alias.
     let stdout = run_qldpc_helper(LOGICAL_BASIS_PY, |w| {
+        writeln!(w, "{}", if reduce { 1 } else { 0 })?;
         write_matrix(&mut *w, hx.view())?;
         write_matrix(&mut *w, hz.view())
     })?;
@@ -111,6 +116,20 @@ fn run_qldpc_helper(
     script: &str,
     write_input: impl FnOnce(&mut dyn Write) -> io::Result<()>,
 ) -> io::Result<Vec<u8>> {
+    // Serialize the input up front so it can both seed the content-addressed
+    // cache key and be fed to the child. qldpc's logical-operator reduction on
+    // the large memory codes takes minutes; since `(script, input)` fully
+    // determines the output, caching it turns that into a one-time cost.
+    let mut input = Vec::new();
+    write_input(&mut input)?;
+    let cache_path = qldpc_cache_path(script, &input);
+    if let Some(path) = &cache_path {
+        if let Ok(cached) = std::fs::read(path) {
+            eprintln!("[qldpc-cache] hit {} ({} bytes)", path.display(), cached.len());
+            return Ok(cached);
+        }
+    }
+
     let python = std::env::var("QLDPC_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let mut child = Command::new(&python)
         .arg("-c")
@@ -126,7 +145,7 @@ fn run_qldpc_helper(
     {
         let stdin = child.stdin.take().expect("stdin was piped");
         let mut w = io::BufWriter::new(stdin);
-        write_input(&mut w)?;
+        w.write_all(&input)?;
         w.flush()?;
     }
 
@@ -138,7 +157,59 @@ fn run_qldpc_helper(
             String::from_utf8_lossy(&output.stderr).trim(),
         )));
     }
+    if let Some(path) = &cache_path {
+        store_qldpc_cache(path, &output.stdout);
+    }
     Ok(output.stdout)
+}
+
+/// Cache file for a qldpc helper invocation, content-addressed by `(script,
+/// input)`. Returns `None` (caching disabled) when no cache directory can be
+/// resolved or `QLDPC_CACHE_DIR` is set empty. The directory is, in order:
+/// `$QLDPC_CACHE_DIR`, `$XDG_CACHE_HOME/qleave/qldpc`, or `$HOME/.cache/qleave/qldpc`.
+fn qldpc_cache_path(script: &str, input: &[u8]) -> Option<PathBuf> {
+    let dir = match std::env::var("QLDPC_CACHE_DIR") {
+        Ok(d) if d.is_empty() => return None, // explicit opt-out
+        Ok(d) => PathBuf::from(d),
+        Err(_) => {
+            let base = std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+            base.join("qleave").join("qldpc")
+        }
+    };
+    // Two FNV-1a streams over the inputs in opposite orders, plus the input
+    // length, give a 128-bit key whose collision odds across the handful of
+    // codes here are negligible.
+    let h1 = fnv1a64(&[script.as_bytes(), input]);
+    let h2 = fnv1a64(&[input, script.as_bytes()]);
+    Some(dir.join(format!("{h1:016x}{h2:016x}-{}", input.len())))
+}
+
+/// 64-bit FNV-1a hash of the concatenation of `parts`.
+fn fnv1a64(parts: &[&[u8]]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for part in parts {
+        for &b in *part {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Best-effort write of `bytes` to the cache `path` (creating its directory),
+/// via a temp file + rename so a crash can't leave a truncated entry. Cache I/O
+/// failures are non-fatal — they just mean the next run recomputes.
+fn store_qldpc_cache(path: &PathBuf, bytes: &[u8]) {
+    let Some(dir) = path.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Write a boolean matrix in the helper's wire format: a `rows cols` header line
@@ -359,10 +430,18 @@ impl CodeData {
         memory: &CSSCodeBlock,
         processor: &CSSCodeBlock,
         magic: &CSSCodeBlock,
+        reduce_max_qubits: usize,
     ) -> io::Result<CodeData> {
+        // Decide per block whether to run qldpc's BP+OSD weight reduction: its cost
+        // grows steeply with code size (bb18/248q ~0.1s, lp3_5_20/1122q ~50s,
+        // lp3_7_20/4350q >10min), so reduce the small processor/magic blocks — for
+        // lower-weight logicals and cheaper surgery — but skip the large memory code,
+        // whose reduction is intractable. `reduce_max_qubits` is that cutoff in
+        // physical qubits (`hx` columns).
         let block = |b: &CSSCodeBlock| -> io::Result<BlockData> {
+            let reduce = b.hx.ncols() <= reduce_max_qubits;
             Ok(BlockData {
-                logical_basis: get_logical_basis(b)?,
+                logical_basis: get_logical_basis(b, reduce)?,
                 stabilizers: get_stabilizers(b),
             })
         };
@@ -692,7 +771,7 @@ mod tests {
             hx: h.clone(),
             hz: h,
         };
-        let basis = get_logical_basis(&block).expect("qldpc helper succeeds");
+        let basis = get_logical_basis(&block, true).expect("qldpc helper succeeds");
 
         // k = 1 logical qubit ⇒ one logical-X and one logical-Z operator.
         assert_eq!(basis.len(), 2);

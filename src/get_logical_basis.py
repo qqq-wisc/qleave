@@ -8,13 +8,18 @@ that environment must have `qldpc` installed.
 
 Wire protocol — whitespace-separated integers throughout:
 
-  stdin    rows cols            # h_x: `rows` checks over `cols` physical qubits
+  stdin    reduce               # 1 = run BP+OSD weight reduction, 0 = skip it
+           rows cols            # h_x: `rows` checks over `cols` physical qubits
            <rows*cols bits>     # row-major 0/1
            rows cols            # h_z, same layout
            <rows*cols bits>
 
   stdout   rows cols            # logical-ops matrix: rows = 2k, cols = 2n
            <rows*cols bits>     # cols 0..n = X-type support, n..2n = Z-type
+
+The reduction (qldpc's BP+OSD `reduce_logical_ops`) minimizes logical-operator
+weight but dominates build time on the large memory codes; skipping it returns a
+valid but higher-weight basis quickly, for fast iteration/profiling.
 """
 
 import sys
@@ -32,11 +37,13 @@ def read_matrix(tokens):
 
 def main():
     tokens = iter(sys.stdin.read().split())
+    reduce = int(next(tokens))
     h_x = read_matrix(tokens)
     h_z = read_matrix(tokens)
 
     code = CSSCode(h_x, h_z)
-    code.reduce_logical_ops(with_BP_OSD=True, osd_method="osd_cs", osd_order=10)
+    if reduce:
+        code.reduce_logical_ops(with_BP_OSD=True, osd_method="osd_cs", osd_order=10)
     ops = np.asarray(code.get_logical_ops()).astype(int)
 
     rows, cols = ops.shape

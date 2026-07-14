@@ -92,6 +92,8 @@ impl<A: PauliStringIndex> PauliString<A> {
         pairs.sort_unstable_by_key(|&(q, _)| q);
         Self(pairs)
     }
+
+
 }
 
 impl<A: PauliStringIndex> std::ops::Deref for PauliString<A> {
@@ -310,7 +312,7 @@ pub enum PauliProductOperation {
     FrameReset(ArchitectureQubit),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PPRAngle {
     PiOver8,
     PiOver4,

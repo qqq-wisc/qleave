@@ -6,6 +6,7 @@ use crate::pbc::{
     Sign::{NegOne, One},
 };
 
+use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -873,6 +874,143 @@ pub fn compile_steps(
     (load_store, pbc, clifford_free)
 }
 
+fn explicit_cliffords(
+    circ: &PauliProductCircuit,
+    ancilla: ArchitectureQubit,
+) -> PauliProductCircuit {
+    let mut result = PauliProductCircuit::new();
+    result.next_meas_id = circ.next_meas_id;
+    for instr in &circ.instructions {
+        match instr {
+            PauliProductOperation::Rotation { axis, angle } => {
+                if *angle == PiOver4 {
+                    let mut joint_vec: Vec<(ArchitectureQubit, Pauli)> =
+                        axis.pauli_string.iter().cloned().collect();
+                    joint_vec.push((ancilla, Pauli::Y));
+                    let joint_pauli = PauliString::new(joint_vec);
+                    let joint_axis = PauliAxis {
+                        sign: axis.sign,
+                        pauli_string: joint_pauli,
+                    };
+                    let id1 = result.allocate_meas_id();
+                    result
+                        .instructions
+                        .push(PauliProductOperation::Measurement {
+                            axis: joint_axis,
+                            id: id1,
+                        });
+                    let id2 = result.allocate_meas_id();
+                    result
+                        .instructions
+                        .push(PauliProductOperation::Measurement {
+                            axis: PauliAxis {
+                                sign: One,
+                                pauli_string: PauliString::new(vec![(ancilla, Pauli::X)]),
+                            },
+                            id: id2,
+                        });
+                    result
+                        .instructions
+                        .push(PauliProductOperation::ConditionalRotation {
+                            axis: PauliAxis {
+                                sign: axis.sign,
+                                pauli_string: axis.pauli_string.clone(),
+                            },
+                            angle: PiOver2,
+                            condition: AllOf::and(AllOf::single(id1), id2),
+                        });
+                    result.instructions.extend(vec![
+                        PauliProductOperation::Rotation {
+                            axis: PauliAxis {
+                                sign: One,
+                                pauli_string: PauliString::new(vec![(ancilla, Pauli::Z)]),
+                            },
+                            angle: PiOver4,
+                        },
+                        PauliProductOperation::Rotation {
+                            axis: PauliAxis {
+                                sign: One,
+                                pauli_string: PauliString::new(vec![(ancilla, Pauli::X)]),
+                            },
+                            angle: PiOver4,
+                        },
+                        PauliProductOperation::Rotation {
+                            axis: PauliAxis {
+                                sign: One,
+                                pauli_string: PauliString::new(vec![(ancilla, Pauli::Z)]),
+                            },
+                            angle: PiOver4,
+                        },
+                    ]);;
+                    result.instructions.push(PauliProductOperation::ConditionalRotation {
+                        axis: PauliAxis {
+                            sign: One,
+                            pauli_string: PauliString::new(vec![(ancilla, Pauli::X)]),
+                        },
+                        angle: PiOver2,
+                        condition: AllOf::single(id2),
+                    });
+                }
+            }
+            _ => result.instructions.push(instr.clone()),
+        }
+    }
+    result
+}
+
+/// Like [`compile`], but instead of absorbing Cliffords into the measurement
+/// frame, it materializes them as explicit Clifford gadgets on a magic ancilla
+/// (`explicit_cliffords`) before reducing to a measurement-only circuit.
+pub fn compile_explicit_clifford(
+    circ: Circuit,
+    max_subcircuit_size: usize,
+    simulate_corrections: bool,
+    skip_redundant: bool,
+    sat_mode: bool,
+    sat_timeout: Option<u64>,
+) -> PauliProductCircuit {
+    let subcircuits = partition(circ, max_subcircuit_size-1, sat_mode, sat_timeout);
+    let load_store = to_load_store_circuit(&subcircuits, max_subcircuit_size-1, skip_redundant);
+    let pbc = to_pauli_product_circuit(&load_store, simulate_corrections);
+    let explicit = explicit_cliffords(&pbc, ArchitectureQubit::Processor(max_subcircuit_size));
+    let measurement_only = absorb_cliffords(&explicit);
+    let resolved = if simulate_corrections {
+        resolve_corrections(&measurement_only)
+    } else {
+        measurement_only
+    };
+    resolved
+}
+
+/// Like [`compile_steps`] but for the explicit-Clifford pathway. Returns
+/// (load_store, pbc_pre_clifford, pbc_explicit_clifford, pbc_final) for
+/// inspecting all intermediate stages.
+pub fn compile_explicit_clifford_steps(
+    circ: Circuit,
+    max_subcircuit_size: usize,
+    simulate_corrections: bool,
+    skip_redundant: bool,
+    sat_mode: bool,
+    sat_timeout: Option<u64>,
+) -> (
+    LoadStoreCircuit,
+    PauliProductCircuit,
+    PauliProductCircuit,
+    PauliProductCircuit,
+) {
+    let subcircuits = partition(circ, max_subcircuit_size-1, sat_mode, sat_timeout);
+    let load_store = to_load_store_circuit(&subcircuits, max_subcircuit_size-1, skip_redundant);
+    let pbc = to_pauli_product_circuit(&load_store, simulate_corrections);
+    let explicit = explicit_cliffords(&pbc, ArchitectureQubit::Processor(max_subcircuit_size));
+    let measurement_only = absorb_cliffords(&explicit);
+    let resolved = if simulate_corrections {
+        resolve_corrections(&measurement_only)
+    } else {
+        measurement_only
+    };
+    (load_store, pbc, explicit, resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1090,8 +1228,8 @@ mod tests {
         assert_eq!(result.sign, expected_sign);
         assert_eq!(&*result.pauli_string, &[(q, expected_pauli)]);
     }
-        #[test]
-        fn y_pi4_then_y_meas() {
+    #[test]
+    fn y_pi4_then_y_meas() {
         let q = Processor(0);
         let result = absorbed_meas(vec![
             rot(single(One, q, Pauli::Y), PPRAngle::PiOver4),
@@ -1103,7 +1241,7 @@ mod tests {
         assert_eq!(&*result.pauli_string, &[(q, expected_pauli)]);
     }
     #[test]
-    fn z_pi4_xpi4_then_z_meas_twice()  {
+    fn z_pi4_xpi4_then_z_meas_twice() {
         let res = absorbed_meas_vec(vec![
             rot(single(One, Processor(0), Pauli::Z), PPRAngle::PiOver4),
             rot(single(One, Processor(0), Pauli::X), PPRAngle::PiOver4),
@@ -1191,7 +1329,7 @@ mod tests {
         assert_eq!(&*result.pauli_string, &[(q, Pauli::Y)]);
     }
     #[test]
-    fn hadamard_test_x(){
+    fn hadamard_test_x() {
         let q = Processor(0);
         let result = absorbed_meas(vec![
             rot(single(One, q, Pauli::Z), PPRAngle::PiOver4),
@@ -1204,7 +1342,7 @@ mod tests {
         assert_eq!(&*result.pauli_string, &[(q, Pauli::Z)]);
     }
     #[test]
-    fn hadamard_test_z(){
+    fn hadamard_test_z() {
         let q = Processor(0);
         let result = absorbed_meas(vec![
             rot(single(One, q, Pauli::Z), PPRAngle::PiOver4),

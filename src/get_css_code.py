@@ -11,6 +11,10 @@ Cain et al., "Shor's algorithm is possible with as few as 10,000 reconfigurable
 atomic qubits" (arXiv:2603.28627v1), Appendix A:
 
   bb18      [[248,  10, <=18]]  BB,  a = 1 + x^6 y + x^27, b = y^2 + x^15 y^3 + x^24, (l,m)=(31,4)
+  gross     [[144,  12,   12]]  BB,  a = x^3 + y + y^2, b = y^3 + x + x^2, (l,m)=(12,6)
+                                     IBM "gross code" (Bravyi et al. 2024); GeneCS benchmark
+  two_gross  [[288, 12,   18]]  BB,  a = x^3 + y^2 + y^7, b = y^3 + x + x^2, (l,m)=(12,12)
+                                     IBM "two-gross code" (Bravyi et al. 2024); GeneCS benchmark
   lp3_5_20  [[1122, 148, <=20]] LP,  3x5 seed over F2[x]/(x^33 + 1)   (processor, "balanced")
   lp3_7_16  [[2610, 744, <=16]] LP,  3x7 seed over F2[x]/(x^45 + 1)
   lp3_7_20  [[4350, 1224,<=20]] LP,  3x7 seed over F2[x]/(x^75 + 1)   (memory, lp20)
@@ -83,9 +87,32 @@ def bb18():
     return BBCode({x: 31, y: 4}, a, b)
 
 
+def gross():
+    import sympy
+    from qldpc.codes import BBCode
+
+    x, y = sympy.symbols("x y")
+    a = x ** 3 + y + y ** 2
+    b = y ** 3 + x + x ** 2
+    return BBCode({x: 12, y: 6}, a, b)
+
+def two_gross():
+    import sympy
+    from qldpc.codes import BBCode
+
+    x, y = sympy.symbols("x y")
+    a = x ** 3 + y ** 2 + y ** 7
+    b = y ** 3 + x + x ** 2
+    return BBCode({x: 12, y: 12}, a, b)
+
+
 def build_code(name):
     if name == "bb18":
         return bb18()
+    if name == "gross":
+        return gross()
+    if name == "two_gross":
+        return two_gross()
     if name in LP_CODES:
         ell, exps = LP_CODES[name]
         return lp_code(ell, exps)

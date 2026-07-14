@@ -26,20 +26,28 @@ def parse_circuit(filename):
 # Measurement / reset gate names we know how to make noisy.
 _MEASURE_GATES = {"M", "MX", "MY", "MZ", "MR", "MRX", "MRY", "MRZ", "MPP"}
 _RESET_GATES = {"R", "RX", "RY", "RZ"}
+# Two-qubit gates emitted by the ancilla syndrome-extraction lowering
+# (`--ancilla-extraction`). Note `CNOT` is excluded: the compiler also uses it for
+# the rec-controlled byproduct corrections, whose targets pair a measurement record
+# with a qubit rather than two qubits -- those are classical feedforward, not a
+# physical two-qubit gate, so they get no gate noise.
+_TWO_QUBIT_GATES = {"CX", "CY", "CZ"}
 
 
-def add_noise(circuit, p_meas, p_data):
+def add_noise(circuit, p_meas, p_data, p_two=0.0):
     """Return a copy of `circuit` with a phenomenological noise model applied.
 
     - Every measurement gets a `p_meas` probability of reporting a flipped result.
     - Every reset is followed by a `DEPOLARIZE1(p_data)` on the reset qubits.
     - Each MPP block is preceded by `DEPOLARIZE1(p_data)` on its data qubits,
       acting as one round of data noise.
+    - Every two-qubit gate (`CX`/`CY`/`CZ`, from `--ancilla-extraction`) is
+      followed by a `DEPOLARIZE2(p_two)` on each control/target pair.
     """
     noisy = stim.Circuit()
     for inst in circuit:
         if isinstance(inst, stim.CircuitRepeatBlock):
-            body = add_noise(inst.body_copy(), p_meas, p_data)
+            body = add_noise(inst.body_copy(), p_meas, p_data, p_two)
             noisy.append(stim.CircuitRepeatBlock(inst.repeat_count, body))
             continue
 
@@ -62,6 +70,14 @@ def add_noise(circuit, p_meas, p_data):
             qubits = [t.value for t in targets if t.is_qubit_target]
             if qubits:
                 noisy.append("DEPOLARIZE1", qubits, p_data)
+
+        if name in _TWO_QUBIT_GATES and p_two > 0:
+            # Two-qubit gates carry their targets in (control, target) pairs; add
+            # DEPOLARIZE2 on each pair where both endpoints are qubits.
+            for i in range(0, len(targets) - 1, 2):
+                a, b = targets[i], targets[i + 1]
+                if a.is_qubit_target and b.is_qubit_target:
+                    noisy.append("DEPOLARIZE2", [a.value, b.value], p_two)
 
     return noisy
 
@@ -219,6 +235,9 @@ def main():
                         help="measurement flip probability")
     parser.add_argument("--p-data", type=float, default=1e-3,
                         help="data depolarizing probability")
+    parser.add_argument("--p-two", type=float, default=0.0,
+                        help="two-qubit (CX/CY/CZ) depolarizing probability "
+                             "(for --ancilla-extraction circuits)")
     parser.add_argument("--shots", type=int, default=100)
     parser.add_argument("--max-iter", type=int, default=30,
                         help="BP iterations before OSD")
@@ -233,7 +252,7 @@ def main():
         f"{circuit.num_measurements} measurements"
     )
 
-    noisy = add_noise(circuit, args.p_meas, args.p_data)
+    noisy = add_noise(circuit, args.p_meas, args.p_data, args.p_two)
     shortest = noisy.shortest_graphlike_error()
     print(f"shortest graphlike error: {shortest[0].dem_error_terms}")
     print(f"distance: {len(shortest)}")

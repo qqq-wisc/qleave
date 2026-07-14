@@ -96,6 +96,8 @@ def main():
     ap.add_argument("circuit", help="path to a compiled .stim circuit")
     ap.add_argument("--p-meas", type=float, default=1e-3, help="measurement flip probability")
     ap.add_argument("--p-data", type=float, default=1e-3, help="data depolarizing probability")
+    ap.add_argument("--p-two", type=float, default=1e-2,
+                    help="two-qubit (CX/CY/CZ) depolarizing probability (for --ancilla-extraction circuits)")
     ap.add_argument("--top", type=int, default=10, help="max undetectable-error groups to list")
     ap.add_argument("--max-det-set", type=int, default=6,
                     help="search bound: max detection-event-set size to explore")
@@ -113,8 +115,8 @@ def main():
         f"{circuit.num_detectors} detectors, {circuit.num_observables} observables"
     )
 
-    noisy = add_noise(circuit, args.p_meas, args.p_data)
-    print(f"Noise model: p_meas={args.p_meas}, p_data={args.p_data}")
+    noisy = add_noise(circuit, args.p_meas, args.p_data, args.p_two)
+    print(f"Noise model: p_meas={args.p_meas}, p_data={args.p_data}, p_two={args.p_two}")
 
     # 1 + 2: circuit distance and the physical errors that realize it.
     # search_for_undetectable_logical_errors handles non-graphlike DEMs (unlike
@@ -128,9 +130,9 @@ def main():
         f"(det-set<={args.max_det_set}, edge-degree<={args.max_edge_degree}, "
         f"{'exhaustive' if args.exhaustive else 'greedy'})..."
     )
-    with open("shortest_error.sat", "w") as f:
-            print("Writing shortest error to shortest_error.sat")
-            f.write(noisy.shortest_error_sat_problem())
+    # with open("shortest_error.sat", "w") as f:
+    #         print("Writing shortest error to shortest_error.sat")
+    #         f.write(noisy.shortest_error_sat_problem())
     try:
         errors = noisy.search_for_undetectable_logical_errors(
             dont_explore_detection_event_sets_with_size_above=args.max_det_set,

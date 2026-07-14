@@ -63,6 +63,17 @@ pub fn surgery_graph<K: Ord + Copy>(
         build_congestion_aware_expander(&path_graph, config, &mut StdRng::seed_from_u64(config.seed));
     let thickend = thicken(&expander);
     let cellulated = cellulate(&thickend, config.max_check_degree);
+    eprintln!(
+        "[surgery_graph] op_weight={} base_vertices={} base_edges={} levels={} \
+         lambda2={:.3} edge-qubits={} (chords={})",
+        operator.len(),
+        thickend.base_vertices,
+        expander.graph.edge_count(),
+        thickend.levels,
+        expander.lambda2,
+        cellulated.graph.edge_count(),
+        cellulated.chords.len(),
+    );
     // The cellulated graph is unlabeled (`UnGraph<(), ()>`); lift it to carry node
     // weights, then label each port vertex with its code qubit. The ports are the
     // operator's support, vertices `0..|support|` in the order `path_matching_graph`
@@ -450,9 +461,14 @@ impl Default for SurgeryGraphConfig {
             trials: 100,
             reset_period: 2,
             max_iterations: 8,
-            qubit_degree: 5,
+            // d_q / d_c degree bounds. Set to 12 to match GeneCS (arXiv:2605.21746,
+            // §7.1: bound set just above the benchmark codes' max check degree of
+            // ~10). Higher d_q packs more cycles per decongestion layer (less
+            // thickening) and higher d_c yields larger cellulation faces (far fewer
+            // chord qubits); the prior 5/4 ran well under the codes' degree budget.
+            qubit_degree: 12,
             seed: 42,
-            max_check_degree: 4,
+            max_check_degree: 12,
         }
     }
 }
@@ -1455,6 +1471,8 @@ fn lanczos_largest_deflating_ones(
     let mut prev_beta = 0.0f64;
     let mut prev_v = vec![0.0f64; n];
 
+    let mut ritz = 0.0f64;
+    let mut prev_ritz = f64::NEG_INFINITY;
     for _ in 0..m {
         let mut w = matvec(&v);
         for i in 0..n {
@@ -1481,10 +1499,24 @@ fn lanczos_largest_deflating_ones(
         basis.push(v.clone());
         alphas.push(alpha);
 
+        // Largest Ritz value of the order-k tridiagonal accumulated so far
+        // (αs on the diagonal, the βs from prior iterations off it). Only this
+        // single extremal value is needed, so it comes from Sturm-bisection
+        // rather than a full eigendecomposition. At this point `betas` holds
+        // exactly the k−1 off-diagonals of the order-k matrix.
+        ritz = tridiagonal_largest_eigenvalue(&alphas, &betas);
+
         let beta = dot(&w, &w).sqrt();
         if beta < 1e-10 {
             break; // exact invariant subspace reached
         }
+        // The extremal Ritz value converges long before the iteration cap for a
+        // well-separated top eigenvalue; stop once it has stabilized.
+        if (ritz - prev_ritz).abs() <= 1e-10 * (1.0 + ritz.abs()) {
+            break;
+        }
+        prev_ritz = ritz;
+
         betas.push(beta);
         prev_beta = beta;
         prev_v = v;
@@ -1494,26 +1526,72 @@ fn lanczos_largest_deflating_ones(
         }
     }
 
-    // Eigenvalues of the k×k tridiagonal (αs on the diagonal, βs off it) are the
-    // Ritz values approximating M's extremal eigenvalues.
-    let k = alphas.len();
-    let mut tri = vec![0.0f64; k * k];
-    for i in 0..k {
-        tri[i * k + i] = alphas[i];
+    // With the all-ones mode deflated, the largest Ritz value approximates c − λ₂.
+    ritz
+}
+
+/// Largest eigenvalue of the symmetric tridiagonal matrix with diagonal `diag`
+/// and off-diagonal `offdiag` (`offdiag[i]` couples rows `i` and `i+1`), via
+/// Sturm-sequence bisection. The Lanczos driver needs only this one extremal
+/// Ritz value, and bisection costs `O(k)` per step against the `O(k³)` of a
+/// full eigendecomposition that would discard all but the top eigenvalue.
+fn tridiagonal_largest_eigenvalue(diag: &[f64], offdiag: &[f64]) -> f64 {
+    let k = diag.len();
+    if k == 0 {
+        return 0.0;
     }
-    // The k×k tridiagonal has only k−1 off-diagonals. If the loop ran to its
-    // full iteration count without an early break, `betas` holds an extra
-    // trailing residual norm (not part of T); ignore it.
-    for (i, &b) in betas.iter().enumerate() {
-        if i + 1 >= k {
+    if k == 1 {
+        return diag[0];
+    }
+
+    // Number of eigenvalues strictly below `x`, read off the signs of the LDLᵀ
+    // pivots of `T − xI` (a Sturm sequence): the count of negative pivots.
+    let count_below = |x: f64| -> usize {
+        let mut count = 0usize;
+        let mut q = diag[0] - x;
+        if q < 0.0 {
+            count += 1;
+        }
+        for i in 1..k {
+            // Guard a zero pivot so the recurrence can't divide by zero.
+            let denom = if q.abs() < 1e-300 { 1e-300 } else { q };
+            q = (diag[i] - x) - offdiag[i - 1] * offdiag[i - 1] / denom;
+            if q < 0.0 {
+                count += 1;
+            }
+        }
+        count
+    };
+
+    // Gershgorin bracket: every eigenvalue lies in some disk [d_i − r_i, d_i + r_i]
+    // with r_i the sum of the adjacent off-diagonal magnitudes.
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for i in 0..k {
+        let left = if i > 0 { offdiag[i - 1].abs() } else { 0.0 };
+        let right = if i + 1 < k { offdiag[i].abs() } else { 0.0 };
+        lo = lo.min(diag[i] - left - right);
+        hi = hi.max(diag[i] + left + right);
+    }
+    // Widen so the largest eigenvalue is strictly interior to the bracket.
+    let pad = (1.0 + hi.abs()) * 1e-9;
+    lo -= pad;
+    hi += pad;
+
+    // Bisect for the boundary where `count_below` first reaches k — the largest
+    // eigenvalue. `O(k)` per step, ~60 steps to roundoff-level precision.
+    for _ in 0..100 {
+        let mid = 0.5 * (lo + hi);
+        if count_below(mid) >= k {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+        if hi - lo <= 1e-12 * (1.0 + hi.abs()) {
             break;
         }
-        tri[i * k + (i + 1)] = b;
-        tri[(i + 1) * k + i] = b;
     }
-    let ritz = symmetric_eigenvalues(tri, k); // ascending
-    // With the all-ones mode deflated, the largest Ritz value approximates c − λ₂.
-    ritz[k - 1]
+    0.5 * (lo + hi)
 }
 
 /// Eigenvalues of a real symmetric `n × n` matrix (row-major), sorted ascending,
