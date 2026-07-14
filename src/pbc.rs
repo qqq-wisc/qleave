@@ -78,7 +78,10 @@ impl Default for Sign {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+// `PartialEq`/`Hash` are structural but canonical: `new` sorts by qubit index,
+// so equal supports compare equal (used as a memoization key in
+// `circuit_to_checks`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PauliString<A>(Vec<(A, Pauli)>);
 
 pub trait PauliStringIndex: Copy + std::cmp::Ord {}
@@ -230,7 +233,7 @@ impl<A: PauliStringIndex> PauliAxis<A> {
 // ---------------------------------------------------------------------------
 
 /// A physical qubit of a single code block, identified by its within-block index.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct PhysicalQubit(pub usize);
 impl PauliStringIndex for PhysicalQubit {}
 
@@ -319,7 +322,7 @@ pub enum PPRAngle {
     PiOver2,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Pauli {
     X,
     Y,

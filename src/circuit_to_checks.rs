@@ -1,11 +1,12 @@
 use crate::{
-    graph_construction::{SurgeryGraphConfig, bridge_surgery_graphs, surgery_graph},
+    graph_construction::{SurgeryGraph, SurgeryGraphConfig, bridge_surgery_graphs, surgery_graph},
     graph_to_checks::{CorrectionSupport, get_correction_support, graph_to_checks, operator_edge_basis},
     pbc::{
         ArchitectureQubit::{Magic, Memory, Processor}, CodePauli, CodeQubit, GraphPauli, Pauli, PauliAxis, PauliProductCircuit, PauliProductOperation, PauliString, PhysicalPauliString, PhysicalQubit, Sign, lift_code_to_merged, pauli_string_mult
     },
 };
 use ndarray;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -355,7 +356,7 @@ enum BlockSupport<'a> {
     ProcessorMagic(&'a PhysicalPauliString, &'a PhysicalPauliString),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PhysicalSupport {
     sign: Sign,
     memory: PhysicalPauliString,
@@ -567,6 +568,27 @@ struct BlockSurgery<'a> {
     kind: BlockKind,
 }
 
+/// Per-block surgery graphs memoized on `(kind, support)`. The other inputs to
+/// [`surgery_graph`] — the block's stabilizers and the config — are fixed for one
+/// lowering pass, and the sign never enters graph construction, so this key is
+/// exact. Keying per block (rather than per whole measurement) lets a block-side
+/// piece be reused across different partners: e.g. every T-gadget measures the
+/// same magic-block logical, so its graph is built once for the whole circuit.
+type GraphCache = HashMap<(BlockKind, PhysicalPauliString), SurgeryGraph<BlockKind>>;
+
+/// The surgery graph for (`kind`, `support`), built on first use and cached.
+fn cached_surgery_graph<'c>(
+    cache: &'c mut GraphCache,
+    stabilizers: &Vec<PhysicalPauliString>,
+    support: &PhysicalPauliString,
+    kind: BlockKind,
+    config: &SurgeryGraphConfig,
+) -> &'c SurgeryGraph<BlockKind> {
+    cache
+        .entry((kind, support.clone()))
+        .or_insert_with(|| surgery_graph(stabilizers, support, kind, config))
+}
+
 /// Build the merged-code checks for a support spanning the two blocks `a` and `b`:
 /// bridge their surgery graphs, lift both blocks' stabilizers into the merged code
 /// (in bridge order — `a` first, then `b`, so they align with the bridged graph's
@@ -580,10 +602,16 @@ fn bridged_checks(
     sign: Sign,
     distance: usize,
     config: &SurgeryGraphConfig,
+    graph_cache: &mut GraphCache,
 ) -> Deformation {
-    let a_graph = surgery_graph(a.stabilizers, a.support, a.kind, config);
-    let b_graph = surgery_graph(b.stabilizers, b.support, b.kind, config);
-    let graph = bridge_surgery_graphs(&a_graph, &b_graph, distance);
+    // Fill both entries first, then re-borrow immutably: the two per-block
+    // graphs must be alive at once for bridging, which one `&mut` helper call
+    // at a time can't provide.
+    cached_surgery_graph(graph_cache, a.stabilizers, a.support, a.kind, config);
+    cached_surgery_graph(graph_cache, b.stabilizers, b.support, b.kind, config);
+    let a_graph = &graph_cache[&(a.kind, a.support.clone())];
+    let b_graph = &graph_cache[&(b.kind, b.support.clone())];
+    let graph = bridge_surgery_graphs(a_graph, b_graph, distance);
 
     let code_stabilizers: Vec<CodePauli<BlockKind>> = a
         .stabilizers
@@ -623,8 +651,9 @@ fn single_block_checks(
     static_stabilizers: Vec<GraphPauli<BlockKind>>,
     sign: Sign,
     config: &SurgeryGraphConfig,
+    graph_cache: &mut GraphCache,
 ) -> Deformation {
-    let graph = surgery_graph(b.stabilizers, b.support, b.kind, config);
+    let graph = cached_surgery_graph(graph_cache, b.stabilizers, b.support, b.kind, config);
 
     let code_stabilizers: Vec<CodePauli<BlockKind>> = b
         .stabilizers
@@ -638,9 +667,9 @@ fn single_block_checks(
     };
 
     let edge_basis = operator_edge_basis(&operator);
-    let mut checks = graph_to_checks(&graph, &code_stabilizers, &operator);
+    let mut checks = graph_to_checks(graph, &code_stabilizers, &operator);
     checks.extend(static_stabilizers);
-    let corrections = get_correction_support(&graph, &operator);
+    let corrections = get_correction_support(graph, &operator);
     Deformation { checks, corrections, edge_basis }
 }
 
@@ -676,8 +705,30 @@ fn physical_supports_to_stabilizer_sets(
             .collect()
     };
 
+    // Identical supports lower to identical deformations (codes/distance/config
+    // are fixed for this call), so memoize on the support: circuits routinely
+    // measure the same Pauli product many times, and surgery-graph construction
+    // dominates this pass.
+    let mut cache: HashMap<&PhysicalSupport, Deformation> = HashMap::new();
+    // Beneath that, per-block graphs are memoized separately (see [`GraphCache`]),
+    // so measurements that share only one side — e.g. the magic piece of every
+    // T-gadget — still reuse the expensive graph construction.
+    let mut graph_cache = GraphCache::new();
+
     let mut stabilizers = Vec::new();
-    for support in supports {
+    for (i, support) in supports.iter().enumerate() {
+        eprintln!(
+            "[surgery_graph] lowering support: {}/{}",
+            i + 1,
+            supports.len()
+        );
+        if let Some(hit) = cache.get(support) {
+            eprintln!(
+                "[surgery_graph] cache hit!"
+            );
+            stabilizers.push(hit.clone());
+            continue;
+        }
         let deformation = match support.block_support() {
             BlockSupport::Single(support_ps, kind) => {
                 let (stabs, static_kinds) = match kind {
@@ -690,6 +741,7 @@ fn physical_supports_to_stabilizer_sets(
                     lift_static(static_kinds),
                     support.sign,
                     config,
+                    &mut graph_cache,
                 )
             }
             BlockSupport::MemoryProcessor(memory, processor) => bridged_checks(
@@ -699,6 +751,7 @@ fn physical_supports_to_stabilizer_sets(
                 support.sign,
                 distance,
                 config,
+                &mut graph_cache,
             ),
             BlockSupport::MemoryMagic(memory, magic) => bridged_checks(
                 block(memory_stabilizers, memory, BlockKind::Memory),
@@ -707,6 +760,7 @@ fn physical_supports_to_stabilizer_sets(
                 support.sign,
                 distance,
                 config,
+                &mut graph_cache,
             ),
             BlockSupport::ProcessorMagic(processor, magic) => bridged_checks(
                 block(processor_stabilizers, processor, BlockKind::Processor),
@@ -715,8 +769,10 @@ fn physical_supports_to_stabilizer_sets(
                 support.sign,
                 distance,
                 config,
+                &mut graph_cache,
             ),
         };
+        cache.insert(support, deformation.clone());
         stabilizers.push(deformation);
     }
     stabilizers

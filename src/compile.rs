@@ -941,7 +941,7 @@ fn explicit_cliffords(
                             },
                             angle: PiOver4,
                         },
-                    ]);;
+                    ]);
                     result.instructions.push(PauliProductOperation::ConditionalRotation {
                         axis: PauliAxis {
                             sign: One,
@@ -950,6 +950,9 @@ fn explicit_cliffords(
                         angle: PiOver2,
                         condition: AllOf::single(id2),
                     });
+                }
+                else {
+                    result.instructions.push(instr.clone());
                 }
             }
             _ => result.instructions.push(instr.clone()),
@@ -972,14 +975,25 @@ pub fn compile_explicit_clifford(
     let subcircuits = partition(circ, max_subcircuit_size-1, sat_mode, sat_timeout);
     let load_store = to_load_store_circuit(&subcircuits, max_subcircuit_size-1, skip_redundant);
     let pbc = to_pauli_product_circuit(&load_store, simulate_corrections);
-    let explicit = explicit_cliffords(&pbc, ArchitectureQubit::Processor(max_subcircuit_size));
-    let measurement_only = absorb_cliffords(&explicit);
+    // Sample the T-gadget conditionals first: conditional π/4 S-corrections
+    // materialize as real rotations so explicit_cliffords gadgetizes them.
     let resolved = if simulate_corrections {
-        resolve_corrections(&measurement_only)
+        resolve_corrections(&pbc)
     } else {
-        measurement_only
+        pbc
     };
-    resolved
+    // The ancilla lives in the processor slot freed by partitioning with
+    // capacity `max_subcircuit_size - 1`; the block's valid logical indices
+    // are 0..max_subcircuit_size.
+    let explicit = explicit_cliffords(&resolved, ArchitectureQubit::Processor(max_subcircuit_size - 1));
+    // Then sample the π/2 conditionals the gadgets themselves emit. Gadgets
+    // never emit conditional π/4s, so no further gadgetization is needed.
+    let resolved = if simulate_corrections {
+        resolve_corrections(&explicit)
+    } else {
+        explicit
+    };
+    absorb_cliffords(&resolved)
 }
 
 /// Like [`compile_steps`] but for the explicit-Clifford pathway. Returns
@@ -1001,14 +1015,23 @@ pub fn compile_explicit_clifford_steps(
     let subcircuits = partition(circ, max_subcircuit_size-1, sat_mode, sat_timeout);
     let load_store = to_load_store_circuit(&subcircuits, max_subcircuit_size-1, skip_redundant);
     let pbc = to_pauli_product_circuit(&load_store, simulate_corrections);
-    let explicit = explicit_cliffords(&pbc, ArchitectureQubit::Processor(max_subcircuit_size));
-    let measurement_only = absorb_cliffords(&explicit);
+    // Same two-stage resolution as `compile_explicit_clifford`: sample the
+    // T-gadget conditionals before gadgetizing, then the gadgets' own π/2
+    // conditionals after.
     let resolved = if simulate_corrections {
-        resolve_corrections(&measurement_only)
+        resolve_corrections(&pbc)
     } else {
-        measurement_only
+        pbc.clone()
     };
-    (load_store, pbc, explicit, resolved)
+    // Same reserved-slot ancilla as `compile_explicit_clifford`.
+    let explicit = explicit_cliffords(&resolved, ArchitectureQubit::Processor(max_subcircuit_size - 1));
+    let resolved = if simulate_corrections {
+        resolve_corrections(&explicit)
+    } else {
+        explicit.clone()
+    };
+    let measurement_only = absorb_cliffords(&resolved);
+    (load_store, pbc, explicit, measurement_only)
 }
 
 #[cfg(test)]
