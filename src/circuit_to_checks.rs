@@ -887,4 +887,131 @@ mod tests {
         assert_eq!(basis[0].len(), 3);
         assert_eq!(basis[1].len(), 3);
     }
+
+    /// GF(2) span diagnostics for a single-block merge: which operators does the
+    /// emitted check group actually measure? Used to debug the X⊗Y mis-lowering
+    /// (explicit-clifford H gadget). Run with
+    /// `QLDPC_PYTHON=… cargo test debug_xy_merge_span -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "requires a Python interpreter with qldpc (set QLDPC_PYTHON)"]
+    fn debug_xy_merge_span() {
+        use crate::pbc::{ArchitectureQubit, MeasId, MergedCodeQubit, PauliProductOperation};
+
+        let blocks = crate::arch::SMALL.css_blocks().expect("css blocks");
+        let codes =
+            CodeData::from_blocks(&blocks.0, &blocks.1, &blocks.2, 2000).expect("code data");
+        let config = SurgeryGraphConfig::default();
+
+        let support_for = |sites: Vec<(ArchitectureQubit, Pauli)>| -> PhysicalSupport {
+            let op = PauliProductOperation::Measurement {
+                axis: PauliAxis { sign: Sign::One, pauli_string: PauliString::new(sites) },
+                id: MeasId(0),
+            };
+            operation_to_physical_support(
+                &op,
+                &codes.memory.logical_basis,
+                &codes.processor.logical_basis,
+                &codes.magic.logical_basis,
+            )
+        };
+
+        // Bit-pack a merged-code Pauli over an interned column space: x-part then
+        // z-part, one bit per (qubit, axis).
+        type Q = MergedCodeQubit<BlockKind>;
+        fn pack(
+            p: &GraphPauli<BlockKind>,
+            col: &mut std::collections::BTreeMap<Q, usize>,
+        ) -> Vec<(usize, bool, bool)> {
+            p.pauli_string
+                .iter()
+                .filter(|&&(_, pl)| pl != Pauli::I)
+                .map(|&(q, pl)| {
+                    let next = col.len();
+                    let c = *col.entry(q).or_insert(next);
+                    (c, matches!(pl, Pauli::X | Pauli::Y), matches!(pl, Pauli::Z | Pauli::Y))
+                })
+                .collect()
+        }
+
+        // Test span membership of `targets` in the row space of `rows` (GF(2),
+        // symplectic bit representation).
+        fn in_span(rows: &[Vec<(usize, bool, bool)>], target: &Vec<(usize, bool, bool)>, ncols: usize) -> bool {
+            let words = (2 * ncols).div_ceil(64);
+            let to_vec = |r: &Vec<(usize, bool, bool)>| -> Vec<u64> {
+                let mut v = vec![0u64; words];
+                for &(c, x, z) in r {
+                    if x {
+                        v[c >> 6] ^= 1 << (c & 63);
+                    }
+                    if z {
+                        let zc = ncols + c;
+                        v[zc >> 6] ^= 1 << (zc & 63);
+                    }
+                }
+                v
+            };
+            let mut basis: Vec<(usize, Vec<u64>)> = Vec::new(); // (pivot, row)
+            let reduce = |v: &mut Vec<u64>, basis: &Vec<(usize, Vec<u64>)>| {
+                for (p, b) in basis {
+                    if (v[p >> 6] >> (p & 63)) & 1 == 1 {
+                        for k in 0..v.len() {
+                            v[k] ^= b[k];
+                        }
+                    }
+                }
+            };
+            for r in rows {
+                let mut v = to_vec(r);
+                reduce(&mut v, &basis);
+                if let Some(p) = (0..2 * ncols).find(|&i| (v[i >> 6] >> (i & 63)) & 1 == 1) {
+                    basis.push((p, v));
+                }
+            }
+            let mut t = to_vec(target);
+            reduce(&mut t, &basis);
+            t.iter().all(|&w| w == 0)
+        }
+
+        use ArchitectureQubit::Processor as P;
+        for (name, sites) in [
+            ("X[P0]*Y[P9]", vec![(P(0), Pauli::X), (P(9), Pauli::Y)]),
+            ("Z[P0]*Y[P9]", vec![(P(0), Pauli::Z), (P(9), Pauli::Y)]),
+        ] {
+            let support = support_for(sites);
+            let defs =
+                physical_supports_to_stabilizer_sets(&codes, 3, &[support.clone()], &config);
+            let def = &defs[0];
+            let mut col: std::collections::BTreeMap<Q, usize> = std::collections::BTreeMap::new();
+            let rows: Vec<_> = def.checks.iter().map(|c| pack(c, &mut col)).collect();
+
+            let merged_l = lift_physical_to_merged(&support.processor, BlockKind::Processor);
+            let k = codes.processor.logical_basis.len() / 2;
+            let mut probes: Vec<(String, GraphPauli<BlockKind>)> =
+                vec![("L (the measured operator)".into(), merged_l)];
+            for q in [0usize, 9] {
+                for (axis, row) in [("X", q), ("Z", q + k)] {
+                    probes.push((
+                        format!("{axis}_L(P{q})"),
+                        lift_physical_to_merged(
+                            &codes.processor.logical_basis[row],
+                            BlockKind::Processor,
+                        ),
+                    ));
+                }
+            }
+            let ncols = {
+                // Pre-intern all probe columns so packing is stable.
+                let mut all_rows = rows.clone();
+                for (_, p) in &probes {
+                    all_rows.push(pack(p, &mut col));
+                }
+                col.len()
+            };
+            eprintln!("=== operator {name}: {} checks ===", def.checks.len());
+            for (pname, p) in &probes {
+                let t = pack(p, &mut col);
+                eprintln!("  {pname} in span of checks: {}", in_span(&rows, &t, ncols));
+            }
+        }
+    }
 }

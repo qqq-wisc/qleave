@@ -16,6 +16,7 @@ use qleave::{
     graph_construction::SurgeryGraphConfig,
     parse::parse,
     pbc::Pauli,
+    sec_schedule::SecSchedule,
 };
 use std::{
     fs,
@@ -103,6 +104,22 @@ impl From<Basis> for Pauli {
     }
 }
 
+/// CLI face of [`SecSchedule`]; see the `--sec-schedule` flag.
+#[derive(Clone, Copy, ValueEnum)]
+enum SecScheduleArg {
+    Lrc,
+    Legacy,
+}
+
+impl From<SecScheduleArg> for SecSchedule {
+    fn from(s: SecScheduleArg) -> Self {
+        match s {
+            SecScheduleArg::Lrc => SecSchedule::Lrc,
+            SecScheduleArg::Legacy => SecSchedule::Legacy,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(about = "Compile a QASM circuit to a Pauli product circuit")]
 struct Cli {
@@ -173,6 +190,12 @@ struct Cli {
     /// TICK-layered syndrome-extraction circuit (no noise injected).
     #[arg(long)]
     syndrome_extraction_circuits: bool,
+
+    /// (to_physical / memory) Syndrome-extraction schedule: staggered left-right
+    /// circuits (arXiv:2603.05481; conflict-phased, edge-colored, cross-round
+    /// staggering) or the legacy check-colored lockstep schedule.
+    #[arg(long, value_enum, default_value_t = SecScheduleArg::Lrc)]
+    sec_schedule: SecScheduleArg,
 
     /// (to_physical / memory) Skip the transversal readout, logical-observable and
     /// final-detector pass (the stabilizer-frame solve). Produces a circuit with no
@@ -469,7 +492,7 @@ fn run_to_physical(cli: &Cli, circuit_path: &Path, circuit: Circuit) {
     }
     let physical = memory.flatten();
     let physical = if cli.syndrome_extraction_circuits {
-        physical.expand_mpp_to_sec()
+        physical.expand_mpp_to_sec(cli.sec_schedule.into())
     } else {
         physical
     };
@@ -587,7 +610,7 @@ fn run_plain_memory(cli: &Cli) {
     }
     let physical = memory.flatten();
     let physical = if cli.syndrome_extraction_circuits {
-        physical.expand_mpp_to_sec()
+        physical.expand_mpp_to_sec(cli.sec_schedule.into())
     } else {
         physical
     };

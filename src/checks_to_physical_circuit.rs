@@ -9,6 +9,7 @@ use crate::{
     graph_construction::SurgeryGraphConfig,
     graph_to_checks::CorrectionSupport,
     pbc::{GraphPauli, MergedCodeQubit, Pauli, PauliAxis, PauliStringIndex, PhysicalQubit, Sign},
+    sec_schedule::SecSchedule,
 };
 
 /// The qubit type gates range over while the circuit is being built: a merged-code
@@ -89,7 +90,7 @@ impl PhysicalCircuit<MergedQubit> {
                 MergedCodeQubit::CodeQubit { .. } => code_qubits += 1,
             }
         }
-        let sec = self.flatten().expand_mpp_to_sec();
+        let sec = self.flatten().expand_mpp_to_sec(SecSchedule::Lrc);
         CircuitStats {
             code_qubits,
             edge_qubits,
@@ -194,26 +195,33 @@ impl PhysicalCircuit<usize> {
     /// are allocated from a reused pool `n..n+pool_size` where `pool_size` is the widest
     /// syndrome round. The j-th check of *every* round uses ancilla `n + j` — one
     /// dedicated ancilla per check slot, reset and reused each round (and shared by the
-    /// `REPEAT` body and the reference round). Within a round the *checks* are greedily
-    /// colored — checks sharing a data qubit get different colors — and each color class
-    /// (mutually qubit-disjoint checks) runs in lockstep, one class after another. Every
-    /// data qubit is therefore touched at most once per TICK layer; depth is the sum over
-    /// color classes of the largest check weight in the class.
+    /// `REPEAT` body and the reference round).
     ///
-    /// The check coloring is required for *correctness*, not just physical layering: the
-    /// single-ancilla gadget cancels its spurious ancilla–ancilla `CZ` hooks only when
-    /// each check's controlled-Paulis stay contiguous relative to any check it shares a
-    /// qubit with (two commuting CSS checks overlap on an even number of qubits, so the
-    /// kickbacks cancel in pairs). Disjoint checks (same class) carry no hooks and may run
-    /// concurrently; shared-qubit checks fall in different classes and so run in disjoint,
-    /// sequential time spans. The resulting layers double as the *physical* gate cycles
-    /// for a downstream circuit-level noise model — this pass injects no noise. NOTE: one
-    /// ancilla per check with a serial CNOT chain is the textbook parity gadget and is
-    /// *not necessarily distance-optimal* under that noise (hook-error orientation / flag
-    /// qubits would be the refinement); that is out of scope here.
-    pub fn expand_mpp_to_sec(&self) -> PhysicalCircuit<usize> {
+    /// Two schedules are available (see [`crate::sec_schedule`] for the hook-cancellation
+    /// theory both rest on):
+    ///
+    /// * [`SecSchedule::Lrc`] — staggered left–right circuits (arXiv:2603.05481):
+    ///   only sitewise-*anticommuting* checks are serialized; commuting checks
+    ///   interleave freely under a bipartite edge coloring, and the two conflict
+    ///   classes overlap across round boundaries. Records are permuted, so every
+    ///   downstream `rec[-k]` is rewritten through the resulting permutation.
+    /// * [`SecSchedule::Legacy`] — the original greedy check-coloring: checks sharing
+    ///   *any* data qubit run in sequential lockstep color classes (depth = sum over
+    ///   classes of the largest check weight); record order is untouched. Kept for
+    ///   A/B comparison.
+    ///
+    /// The resulting layers double as the *physical* gate cycles for a downstream
+    /// circuit-level noise model — this pass injects no noise. NOTE: one ancilla per
+    /// check is the textbook parity gadget and is *not necessarily distance-optimal*
+    /// under that noise (hook-error orientation / flag qubits would be the refinement);
+    /// that is out of scope here.
+    pub fn expand_mpp_to_sec(&self, schedule: SecSchedule) -> PhysicalCircuit<usize> {
         let base = max_qubit(&self.gates).map_or(0, |m| m + 1);
-        PhysicalCircuit { gates: expand_gates(&self.gates, base) }
+        let gates = match schedule {
+            SecSchedule::Lrc => crate::sec_schedule::expand_gates_lrc(&self.gates, base),
+            SecSchedule::Legacy => expand_gates(&self.gates, base),
+        };
+        PhysicalCircuit { gates }
     }
 }
 
@@ -538,7 +546,7 @@ fn concatenate_circuits(
 }
 
 #[derive(Debug, Clone)]
-enum PhysicalGate<Q> {
+pub(crate) enum PhysicalGate<Q> {
     /// Reset a qubit into the `+1` eigenstate of the given Pauli basis, lowered to
     /// stim's `RX` / `RY` / `RZ` (`Z` is the usual `|0>`).
     Reset(Pauli, Q),
@@ -587,9 +595,9 @@ pub fn checks_to_physical_circuit(
     for qubit in qubits {
         circuit.add_gate(PhysicalGate::Reset(Pauli::Z, qubit));
     }
-    for Deformation { checks, corrections, edge_basis: _ } in checks.deformations.into_iter() {
+    for Deformation { checks, corrections, edge_basis } in checks.deformations.into_iter() {
         let new_subcircuit =
-            one_ppm_to_physical_circuit(checks, corrections, base_checks.clone(), rounds);
+            one_ppm_to_physical_circuit(checks, corrections, base_checks.clone(), rounds, edge_basis);
         circuit = concatenate_circuits(vec![circuit, new_subcircuit]);
     }
     circuit
@@ -600,12 +608,34 @@ fn one_ppm_to_physical_circuit(
     corrections: Vec<CorrectionSupport<BlockKind>>,
     base_checks: Vec<GraphPauli<BlockKind>>,
     rounds: usize,
+    edge_basis: Pauli,
 ) -> PhysicalCircuit<MergedQubit> {
     let step0 = d_rounds(base_checks.clone(), rounds);
-    let init = initialization(&base_checks);
+    // Initialize this merge's edge qubits in the basis CONJUGATE to the vertex
+    // checks' edge Pauli: |0> for X-edge vertex checks, |+> for Z-edge ones. This
+    // way every vertex check `A_v = P(edges)·L_q` is individually random and only
+    // the collective product `∏A_v = L` is determined — the gauging measurement.
+    // Initializing in the vertex-edge basis instead makes each `A_v` equivalent
+    // to its lone code-qubit factor `L_q`, collapsing the merge into transversal
+    // single-qubit measurements of the support (an entirely different channel;
+    // this was a real bug for every pure-Z operator, whose edge basis is Z).
+    // The explicit reset also matters because edge-qubit ids are reused across
+    // deformations: without it, a later merge starts from the previous split's
+    // leftover MZ eigenstates.
+    let init = initialization(&checks, conjugate_basis(edge_basis));
     let merge = d_rounds(checks.clone(), rounds);
-    let split = split_and_correct(&checks, &corrections);
+    let split = split_and_correct(&checks, &corrections, conjugate_basis(edge_basis));
     concatenate_circuits(vec![step0, init, merge, split])
+}
+
+/// The single-qubit Pauli basis conjugate (anticommuting) to `p`; edge bases are
+/// only ever X or Z.
+fn conjugate_basis(p: Pauli) -> Pauli {
+    match p {
+        Pauli::X => Pauli::Z,
+        Pauli::Z => Pauli::X,
+        _ => unreachable!("edge basis is always X or Z"),
+    }
 }
 
 fn d_rounds(checks: Vec<GraphPauli<BlockKind>>, rounds: usize) -> PhysicalCircuit<MergedQubit> {
@@ -642,7 +672,10 @@ fn d_rounds(checks: Vec<GraphPauli<BlockKind>>, rounds: usize) -> PhysicalCircui
     }
 }
 
-fn initialization(checks: &Vec<GraphPauli<BlockKind>>) -> PhysicalCircuit<MergedQubit> {
+fn initialization(
+    checks: &Vec<GraphPauli<BlockKind>>,
+    basis: Pauli,
+) -> PhysicalCircuit<MergedQubit> {
     let strings = checks.iter().map(|p| &p.pauli_string);
     let edge_qubits: Vec<MergedCodeQubit<BlockKind>> = strings
         .flat_map(|s| s.iter())
@@ -653,20 +686,27 @@ fn initialization(checks: &Vec<GraphPauli<BlockKind>>) -> PhysicalCircuit<Merged
         .collect();
     let gates = edge_qubits
         .iter()
-        .map(|e| PhysicalGate::Reset(Pauli::Z, *e))
+        .map(|e| PhysicalGate::Reset(basis, *e))
         .collect();
     PhysicalCircuit { gates }
 }
 
-/// Split the merged code back apart: measure every edge qubit in `Z`, then apply
-/// the surgery's `X(q)` Pauli byproduct on each operator-support qubit, controlled
-/// on the parity of the edge outcomes along that qubit's correction path
-/// (arXiv:2410.02213, Def. 10, Stage 4). The byproduct is a real frame gate; *how*
-/// each memory readout combines with the resulting records to stay deterministic
-/// is determined later by the symbolic frame solver, not annotated here.
+/// Split the merged code back apart: measure every edge qubit in `split_basis` —
+/// the conjugate of the vertex checks' edge Pauli, so the split destroys the
+/// individual `A_v` (gauge) checks while the collective `∏A_v = L` and the
+/// deformed code stabilizers survive — then apply the surgery's `X(q)` Pauli
+/// byproduct on each operator-support qubit, controlled on the parity of the edge
+/// outcomes along that qubit's correction path (arXiv:2410.02213, Def. 10,
+/// Stage 4). Measuring instead in the vertex-edge basis would *commute* with each
+/// `A_v` and thereby complete a measurement of every single code-qubit factor
+/// `L_q` — the same transversal collapse the conjugate-basis edge init avoids.
+/// The byproduct is a real frame gate; *how* each memory readout combines with
+/// the resulting records to stay deterministic is determined later by the
+/// symbolic frame solver, not annotated here.
 fn split_and_correct(
     checks: &Vec<GraphPauli<BlockKind>>,
     corrections: &Vec<CorrectionSupport<BlockKind>>,
+    split_basis: Pauli,
 ) -> PhysicalCircuit<MergedQubit> {
     let strings = checks.iter().map(|p| &p.pauli_string);
     let edge_qubits: Vec<MergedCodeQubit<BlockKind>> = strings
@@ -678,7 +718,7 @@ fn split_and_correct(
         .collect();
     let mut gates: Vec<PhysicalGate<MergedQubit>> = edge_qubits
         .iter()
-        .map(|e| PhysicalGate::Measure(Pauli::Z, *e, false))
+        .map(|e| PhysicalGate::Measure(split_basis, *e, false))
         .collect();
     for CorrectionSupport { qubit, path } in corrections.iter() {
         for (i, edge_qubit) in edge_qubits.iter().enumerate() {
@@ -1044,23 +1084,30 @@ impl FrameSim {
             }
             self.sym[pivot].clear(); // a reset state is deterministic +1
         } else {
-            // `basis_q` is already a stabilizer; clear its single-qubit generator's sign.
-            for r in self.n..2 * self.n {
-                let single_qubit_basis = match basis {
-                    Pauli::X => {
-                        get_bit(&self.x[r], q)
-                            && self.z[r].iter().all(|&w| w == 0)
-                            && self.x[r].iter().map(|w| w.count_ones()).sum::<u32>() == 1
-                    }
-                    _ => {
-                        get_bit(&self.z[r], q)
-                            && self.x[r].iter().all(|&w| w == 0)
-                            && self.z[r].iter().map(|w| w.count_ones()).sum::<u32>() == 1
-                    }
-                };
-                if single_qubit_basis {
-                    self.sym[r].clear();
-                    break;
+            // `basis_q` is already stabilized, with symbolic sign `s` (the product
+            // of the stabilizers whose destabilizer partner anticommutes with it,
+            // as in `measure`'s deterministic branch). Resetting forces that sign
+            // to +1 — physically a conjugate-Pauli flip conditioned on `s` — so
+            // every generator anticommuting with the flip picks up `s`. Clearing
+            // just a single-qubit generator's sign instead silently corrupts any
+            // other generator sharing the qubit (e.g. a surviving cycle-check row
+            // when a mid-circuit edge re-init hits a qubit still entangled into
+            // earlier check rows).
+            let mut s = std::collections::BTreeSet::new();
+            for d in 0..self.n {
+                if anticommutes(self, d) {
+                    s = &s ^ &self.sym[self.n + d];
+                }
+            }
+            // The flip is the conjugate Pauli at `q`: `X_q` for a Z reset (rows
+            // with Z-content at `q` flip), `Z_q` for an X reset (X-content).
+            let flip_anticommutes = |sim: &Self, r: usize| match basis {
+                Pauli::X => get_bit(&sim.x[r], q),
+                _ => get_bit(&sim.z[r], q),
+            };
+            for r in 0..2 * self.n {
+                if flip_anticommutes(self, r) {
+                    self.sym[r] = &self.sym[r] ^ &s;
                 }
             }
         }
@@ -1199,6 +1246,14 @@ fn solve_memory_observables(
                 sim.x_correction(rid, index[q]);
             }
             _ => {}
+        }
+    }
+
+    // Debug aid (`FRAME_DEBUG=1`): print each record's determinism verdict, for
+    // diffing the symbolic frame sim against an external stim replay.
+    if std::env::var("FRAME_DEBUG").is_ok() {
+        for &rid in &measure_rids {
+            eprintln!("[frame] rec {rid} det={}", !sim.rec[rid].contains(&rid));
         }
     }
 

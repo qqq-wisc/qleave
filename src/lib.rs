@@ -8,4 +8,5 @@ pub mod graph_construction;
 pub mod graph_to_checks;
 pub mod circuit_to_checks;
 pub mod checks_to_physical_circuit;
+pub mod sec_schedule;
 // pub mod mip_partition;
