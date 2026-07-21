@@ -5,7 +5,8 @@ use qleave::{
         SPACE_EFFICIENT_LP_20, SPACE_EFFICIENT_LP_24, TWO_GROSS,
     },
     checks_to_physical_circuit::{
-        CircuitStats, compile_memory_experiment, compile_plain_memory_experiment,
+        CircuitStats, MergedQubit, PhysicalCircuit, compile_memory_experiment,
+        compile_plain_memory_experiment,
     },
     circuit::Circuit,
     circuit_to_checks::{
@@ -215,7 +216,8 @@ struct Cli {
 
     /// (to_physical / memory) Write a JSON stats record (architecture, surgery-graph
     /// config, rounds, per-type qubit counts, syndrome cycles, SEC depth) to this path.
-    #[arg(long)]
+    /// The path is optional; passing `--stats` with no value writes to `stats.json`.
+    #[arg(long, num_args = 0..=1, default_missing_value = "stats.json")]
     stats: Option<PathBuf>,
 
     /// (to_physical) Number of randomized congestion-aware expander
@@ -487,38 +489,74 @@ fn run_to_physical(cli: &Cli, circuit_path: &Path, circuit: Circuit) {
         cli.basis.into(),
         !cli.no_memory_observables,
     );
-    if let Some(path) = &cli.stats {
-        write_stats(path, cli, memory.stats());
-    }
-    let physical = memory.flatten();
-    let physical = if cli.syndrome_extraction_circuits {
-        physical.expand_mpp_to_sec(cli.sec_schedule.into())
-    } else {
-        physical
-    };
-    let stim = physical.to_string();
-
     let output_path = cli.output.clone().unwrap_or_else(|| {
         let stem = circuit_path.file_stem().unwrap_or_default();
         PathBuf::from(stem).with_extension("stim")
     });
+    write_physical(memory, cli, &output_path, "physical circuit");
+}
 
-    if output_path == Path::new("-") {
+/// Lower the compiled merged-qubit circuit and write it out as stim text, emitting
+/// a `--stats` record along the way.
+///
+/// Nothing downstream of the flattened MPP circuit is ever materialized: with
+/// `--syndrome-extraction-circuits` the SEC expansion (which multiplies the gate
+/// count by the check weight) and the stim text (gigabytes on large circuits) are
+/// both streamed gate-by-gate into the output file, so peak memory stays at roughly
+/// the size of the MPP circuit. `sec_depth` is counted during that same pass; when
+/// SEC output is off but `--stats` still wants the metric, a separate counting pass
+/// supplies it — cheap, since it keeps nothing.
+fn write_physical(
+    memory: PhysicalCircuit<MergedQubit>,
+    cli: &Cli,
+    output_path: &Path,
+    what: &str,
+) {
+    /// Output buffer: the stim text runs to gigabytes and is produced a few bytes
+    /// at a time, so a bigger buffer than `BufWriter`'s default 8 KiB is worth it.
+    const BUF_BYTES: usize = 1 << 20;
+
+    // Every other --stats metric is read off the merged circuit, before it is
+    // consumed by the flattening below.
+    let mut stats = cli
+        .stats
+        .as_ref()
+        .map(|_| CircuitStats::compute(&memory, 0));
+    let flat = memory.into_flat();
+
+    let schedule: Option<SecSchedule> = cli
+        .syndrome_extraction_circuits
+        .then(|| cli.sec_schedule.into());
+    if let (Some(stats), None) = (stats.as_mut(), schedule) {
+        stats.sec_depth = flat.sec_tick_count(cli.sec_schedule.into());
+    }
+
+    let ticks = if output_path == Path::new("-") {
         let stdout = io::stdout();
-        let mut h = stdout.lock();
-        if let Err(e) = write!(h, "{stim}") {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                process::exit(0);
-            }
-            eprintln!("error writing to stdout: {e}");
-            process::exit(1);
-        }
+        flat.write_stim(schedule, io::BufWriter::with_capacity(BUF_BYTES, stdout.lock()))
     } else {
-        fs::write(&output_path, &stim).unwrap_or_else(|e| {
-            eprintln!("error writing {}: {e}", output_path.display());
+        let file = fs::File::create(output_path).unwrap_or_else(|e| {
+            eprintln!("error creating {}: {e}", output_path.display());
             process::exit(1);
         });
-        eprintln!("Wrote physical circuit to {}", output_path.display());
+        flat.write_stim(schedule, io::BufWriter::with_capacity(BUF_BYTES, file))
+    };
+    let ticks = ticks.unwrap_or_else(|e| {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            process::exit(0);
+        }
+        eprintln!("error writing {}: {e}", output_path.display());
+        process::exit(1);
+    });
+    if output_path != Path::new("-") {
+        eprintln!("Wrote {what} to {}", output_path.display());
+    }
+
+    if let (Some(path), Some(mut stats)) = (&cli.stats, stats) {
+        if schedule.is_some() {
+            stats.sec_depth = ticks;
+        }
+        write_stats(path, cli, stats);
     }
 }
 
@@ -605,36 +643,9 @@ fn run_plain_memory(cli: &Cli) {
         cli.basis.into(),
         !cli.no_memory_observables,
     );
-    if let Some(path) = &cli.stats {
-        write_stats(path, cli, memory.stats());
-    }
-    let physical = memory.flatten();
-    let physical = if cli.syndrome_extraction_circuits {
-        physical.expand_mpp_to_sec(cli.sec_schedule.into())
-    } else {
-        physical
-    };
-    let stim = physical.to_string();
-
     let output_path = cli
         .output
         .clone()
         .unwrap_or_else(|| PathBuf::from("memory.stim"));
-    if output_path == Path::new("-") {
-        let stdout = io::stdout();
-        let mut h = stdout.lock();
-        if let Err(e) = write!(h, "{stim}") {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                process::exit(0);
-            }
-            eprintln!("error writing to stdout: {e}");
-            process::exit(1);
-        }
-    } else {
-        fs::write(&output_path, &stim).unwrap_or_else(|e| {
-            eprintln!("error writing {}: {e}", output_path.display());
-            process::exit(1);
-        });
-        eprintln!("Wrote plain memory experiment to {}", output_path.display());
-    }
+    write_physical(memory, cli, &output_path, "plain memory experiment");
 }

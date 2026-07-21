@@ -56,7 +56,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::checks_to_physical_circuit::PhysicalGate;
+use crate::checks_to_physical_circuit::{GateSink, PhysicalGate};
 use crate::pbc::{Pauli, PauliAxis, Sign};
 
 /// Which syndrome-extraction schedule
@@ -209,6 +209,10 @@ fn partition_left(checks: &[&PauliAxis<usize>], classes: &[usize]) -> std::colle
     let mut qubit_side: BTreeMap<usize, usize> = BTreeMap::new(); // 0 = left, 1 = right
     // Max qubit degree per (side, class) among assigned qubits.
     let mut max_qdeg = [[0usize; 2]; 2]; // [side][class]
+    // Running max side-weight over already-committed qubits, per (side, class).
+    // Maintained incrementally: assigning a qubit only bumps the checks incident
+    // to it, so there is no need to rescan all `m` checks per candidate.
+    let mut max_check = [[0usize; 2]; 2]; // [side][class]
 
     let mut incident: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (j, check) in checks.iter().enumerate() {
@@ -218,25 +222,23 @@ fn partition_left(checks: &[&PauliAxis<usize>], classes: &[usize]) -> std::colle
     }
 
     for &q in &order {
+        let incident_q = &incident[&q];
         let mut best = (usize::MAX, 0usize);
         for side in [0usize, 1] {
-            // Δ per phase subgraph after assigning q to `side`.
+            // Δ per phase subgraph after assigning q to `side`. Only q's incident
+            // checks change, and only on `side`; every other (s, c) max is the
+            // committed running max unchanged.
             let mut max_q = max_qdeg;
             for class in 0..2 {
                 max_q[side][class] = max_q[side][class].max(deg[&q][class]);
             }
-            let mut max_check = [[0usize; 2]; 2]; // [side][class]
-            for (j, w) in side_weight.iter().enumerate() {
-                let mut w = *w;
-                if incident[&q].contains(&j) {
-                    w[side] += 1;
-                }
-                for s in 0..2 {
-                    max_check[s][classes[j]] = max_check[s][classes[j]].max(w[s]);
-                }
+            let mut mc = max_check;
+            for &j in incident_q {
+                let c = classes[j];
+                mc[side][c] = mc[side][c].max(side_weight[j][side] + 1);
             }
             // Phase 1 = (left, G1) ∥ (right, G2); phase 2 = (left, G2) ∥ (right, G1).
-            let delta = |s: usize, c: usize| max_q[s][c].max(max_check[s][c]);
+            let delta = |s: usize, c: usize| max_q[s][c].max(mc[s][c]);
             let cost = delta(0, 0).max(delta(1, 1)) + delta(0, 1).max(delta(1, 0));
             if cost < best.0 {
                 best = (cost, side);
@@ -247,8 +249,10 @@ fn partition_left(checks: &[&PauliAxis<usize>], classes: &[usize]) -> std::colle
         for class in 0..2 {
             max_qdeg[side][class] = max_qdeg[side][class].max(deg[&q][class]);
         }
-        for &j in &incident[&q] {
+        for &j in incident_q {
             side_weight[j][side] += 1;
+            let c = classes[j];
+            max_check[side][c] = max_check[side][c].max(side_weight[j][side]);
         }
     }
     qubit_side.iter().filter(|&(_, &s)| s == 0).map(|(&q, _)| q).collect()
@@ -436,7 +440,7 @@ impl<'a> StaggeredSeg<'a> {
     /// `rec[-(m−q)]` / `rec[-(2m−q)]`, and the epilogue closes G2's last
     /// comparison with `rec[-(b−q)]` / `rec[-(m+b−q)]`. Each check gets r−1
     /// detectors, as in the MPP stream.
-    fn emit(&self, r: usize, out: &mut Vec<Gate>, map: &mut Vec<usize>) {
+    fn emit<S: GateSink>(&self, r: usize, out: &mut S, map: &mut Vec<usize>) {
         let (m, a, b) = (self.m, self.a, self.b);
         let g1_detectors = || -> Vec<Gate> {
             (0..a).map(|p| PhysicalGate::DeclareDetector(vec![a - p, m + a - p])).collect()
@@ -445,7 +449,7 @@ impl<'a> StaggeredSeg<'a> {
         push_layers(out, self.round_layers(true));
         if r >= 2 {
             push_layers(out, self.round_layers(false));
-            out.extend(g1_detectors());
+            out.extend_gates(g1_detectors());
             if r >= 3 {
                 let mut body = Vec::new();
                 push_layers(&mut body, self.round_layers(false));
@@ -456,7 +460,7 @@ impl<'a> StaggeredSeg<'a> {
         }
         push_layers(out, self.epilogue_layers());
         if r >= 2 {
-            out.extend((0..b).map(|q| PhysicalGate::DeclareDetector(vec![b - q, m + b - q])));
+            out.extend_gates((0..b).map(|q| PhysicalGate::DeclareDetector(vec![b - q, m + b - q])));
         }
 
         let start = map.len();
@@ -474,12 +478,12 @@ impl<'a> StaggeredSeg<'a> {
 }
 
 /// Append `layers` as gates delimited by `TICK`s, dropping empty layers.
-fn push_layers(out: &mut Vec<Gate>, layers: Vec<Vec<Gate>>) {
+fn push_layers<S: GateSink>(out: &mut S, layers: Vec<Vec<Gate>>) {
     for layer in layers {
         if layer.is_empty() {
             continue;
         }
-        out.extend(layer);
+        out.extend_gates(layer);
         out.push(PhysicalGate::Tick);
     }
 }
@@ -488,7 +492,7 @@ fn push_layers(out: &mut Vec<Gate>, layers: Vec<Vec<Gate>>) {
 /// reset layer, each conflict class's edge-colored CNOT layers in class order
 /// (consistent ordering for every conflicting pair), and a measure layer in
 /// check order — so the record stream matches the MPP stream exactly.
-fn emit_round_sequential(checks: &[&PauliAxis<usize>], base: usize, out: &mut Vec<Gate>) {
+fn emit_round_sequential<S: GateSink>(checks: &[&PauliAxis<usize>], base: usize, out: &mut S) {
     let m = checks.len();
     let classes = conflict_classes(checks);
     let n_classes = classes.iter().copied().max().map_or(0, |c| c + 1);
@@ -609,8 +613,10 @@ fn expand_sequential_only(gates: &[Gate], base: usize) -> Vec<Gate> {
 /// the largest data-qubit id); the j-th check of every round uses ancilla
 /// `base + j`, reset and reused round over round — the same pool as the legacy
 /// expansion, so `sec_ancilla_pool` stays valid.
-pub(crate) fn expand_gates_lrc(gates: &[Gate], base: usize) -> Vec<Gate> {
-    let mut out: Vec<Gate> = Vec::new();
+/// Emitted into a [`GateSink`] rather than returned: the expansion is produced
+/// strictly in order and never read back, so the writing path can stream it to
+/// disk instead of holding it (see [`crate::checks_to_physical_circuit::StimWriter`]).
+pub(crate) fn expand_gates_lrc_into<S: GateSink>(gates: &[Gate], base: usize, out: &mut S) {
     // Old→new record permutation; `map.len()` doubles as the running old-record
     // count, which equals the running new-record count everywhere outside a
     // segment (both schedules preserve per-segment record totals).
@@ -654,12 +660,12 @@ pub(crate) fn expand_gates_lrc(gates: &[Gate], base: usize) -> Vec<Gate> {
                     );
                 }
                 if n_classes == 2 && r >= 2 {
-                    StaggeredSeg::new(&checks, classes, base).emit(r, &mut out, &mut map);
+                    StaggeredSeg::new(&checks, classes, base).emit(r, out, &mut map);
                 } else {
                     // Sequential: reference round, then (if matched) a body of
                     // the same round with the original detectors — offsets are
                     // preserved because record order is.
-                    emit_round_sequential(&checks, base, &mut out);
+                    emit_round_sequential(&checks, base, out);
                     if let Some(n) = matched_repeat {
                         let mut body = Vec::new();
                         emit_round_sequential(&checks, base, &mut body);
@@ -703,7 +709,6 @@ pub(crate) fn expand_gates_lrc(gates: &[Gate], base: usize) -> Vec<Gate> {
             }
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -713,6 +718,13 @@ mod tests {
 
     fn axis(sites: &[(usize, Pauli)]) -> PauliAxis<usize> {
         PauliAxis { sign: Sign::One, pauli_string: PauliString::new(sites.to_vec()) }
+    }
+
+    /// The expansion collected into a `Vec`, which these tests inspect.
+    fn expand_gates_lrc(gates: &[Gate], base: usize) -> Vec<Gate> {
+        let mut out = Vec::new();
+        expand_gates_lrc_into(gates, base, &mut out);
+        out
     }
 
     /// `[MPP×m, REPEAT(r−1, [MPP×m, round detectors])]` — the exact `d_rounds`

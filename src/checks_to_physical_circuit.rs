@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 
 use crate::{
     checks_to_physical_circuit::PhysicalGate::DeclareObservable,
@@ -15,7 +16,7 @@ use crate::{
 /// The qubit type gates range over while the circuit is being built: a merged-code
 /// qubit (an edge qubit or a code qubit of some block). Lowered to a flat `usize`
 /// for stim output by [`PhysicalCircuit::flatten`].
-type MergedQubit = MergedCodeQubit<BlockKind>;
+pub type MergedQubit = MergedCodeQubit<BlockKind>;
 
 /// A physical (stim) circuit whose gates range over qubit type `Q`. Built over
 /// [`MergedQubit`] and then lowered to `PhysicalCircuit<usize>` via
@@ -27,6 +28,13 @@ pub struct PhysicalCircuit<Q> {
 impl<Q> PhysicalCircuit<Q> {
     fn new() -> PhysicalCircuit<Q> {
         PhysicalCircuit { gates: vec![] }
+    }
+
+    /// Number of `TICK` timing layers, with `REPEAT(n)` bodies counted `n` times.
+    /// On a SEC-expanded circuit this is the `sec_depth` metric fed to
+    /// [`PhysicalCircuit::stats`].
+    pub fn tick_count(&self) -> usize {
+        count_ticks(&self.gates)
     }
 
     fn add_gate(&mut self, gate: PhysicalGate<Q>) {
@@ -54,6 +62,24 @@ impl<Q: PauliStringIndex> PhysicalCircuit<Q> {
             .collect();
         PhysicalCircuit { gates }
     }
+
+    /// [`PhysicalCircuit::flatten`], consuming the merged-qubit circuit. Identical
+    /// output; the difference is that each source gate is dropped as soon as its
+    /// flat counterpart exists, so the two representations are never both fully
+    /// resident — worth it on circuits whose `MPP` Pauli strings run to gigabytes.
+    pub fn into_flat(self) -> PhysicalCircuit<usize> {
+        let mut ids: BTreeMap<Q, usize> = BTreeMap::new();
+        let mut intern = |q: Q| -> usize {
+            let next = ids.len();
+            *ids.entry(q).or_insert(next)
+        };
+        let gates = self
+            .gates
+            .into_iter()
+            .map(|gate| into_flat_gate(gate, &mut intern))
+            .collect();
+        PhysicalCircuit { gates }
+    }
 }
 
 /// Per-type qubit counts and depth metrics of a compiled physical circuit, for
@@ -77,12 +103,18 @@ pub struct CircuitStats {
     pub sec_depth: usize,
 }
 
-impl PhysicalCircuit<MergedQubit> {
-    /// Summarize the circuit for `--stats`: per-type qubit counts, syndrome-round
-    /// count, and the SEC (ancilla-gadget) depth. See [`CircuitStats`].
-    pub fn stats(&self) -> CircuitStats {
+impl CircuitStats {
+    /// Summarize a compiled circuit for `--stats`: per-type qubit counts,
+    /// syndrome-round count, and the SEC (ancilla-gadget) depth.
+    ///
+    /// Four of the five metrics are read straight off `merged` — the circuit as built,
+    /// before `flatten` and before SEC expansion — because the code-qubit / edge-qubit
+    /// split and the `MPP` round structure both survive only there. `sec_depth` is the
+    /// one metric that lives past expansion, so the caller supplies it via
+    /// [`PhysicalCircuit::tick_count`] on the SEC lowering it has already built.
+    pub fn compute(merged: &PhysicalCircuit<MergedQubit>, sec_depth: usize) -> CircuitStats {
         let mut qubits = std::collections::BTreeSet::new();
-        collect_merged_qubits(&self.gates, &mut qubits);
+        collect_merged_qubits(&merged.gates, &mut qubits);
         let (mut code_qubits, mut edge_qubits) = (0, 0);
         for q in &qubits {
             match q {
@@ -90,13 +122,12 @@ impl PhysicalCircuit<MergedQubit> {
                 MergedCodeQubit::CodeQubit { .. } => code_qubits += 1,
             }
         }
-        let sec = self.flatten().expand_mpp_to_sec(SecSchedule::Lrc);
         CircuitStats {
             code_qubits,
             edge_qubits,
-            sec_ancilla_pool: widest_syndrome_round(&self.gates),
-            syndrome_cycles: count_syndrome_rounds(&self.gates),
-            sec_depth: count_ticks(&sec.gates),
+            sec_ancilla_pool: widest_syndrome_round(&merged.gates),
+            syndrome_cycles: count_syndrome_rounds(&merged.gates),
+            sec_depth,
         }
     }
 }
@@ -216,12 +247,51 @@ impl PhysicalCircuit<usize> {
     /// under that noise (hook-error orientation / flag qubits would be the refinement);
     /// that is out of scope here.
     pub fn expand_mpp_to_sec(&self, schedule: SecSchedule) -> PhysicalCircuit<usize> {
-        let base = max_qubit(&self.gates).map_or(0, |m| m + 1);
-        let gates = match schedule {
-            SecSchedule::Lrc => crate::sec_schedule::expand_gates_lrc(&self.gates, base),
-            SecSchedule::Legacy => expand_gates(&self.gates, base),
-        };
+        let mut gates = Vec::new();
+        self.expand_mpp_to_sec_into(schedule, &mut gates);
         PhysicalCircuit { gates }
+    }
+
+    /// [`PhysicalCircuit::expand_mpp_to_sec`], streamed: every expanded gate is
+    /// handed to `out` as it is produced instead of being collected. The expansion
+    /// of a large circuit is orders of magnitude bigger than the `MPP` form it comes
+    /// from, so the writing path uses this with a [`StimWriter`] sink and never holds
+    /// the expanded circuit at all.
+    pub(crate) fn expand_mpp_to_sec_into<S: GateSink>(&self, schedule: SecSchedule, out: &mut S) {
+        let base = max_qubit(&self.gates).map_or(0, |m| m + 1);
+        match schedule {
+            SecSchedule::Lrc => crate::sec_schedule::expand_gates_lrc_into(&self.gates, base, out),
+            SecSchedule::Legacy => expand_gates_into(&self.gates, base, out),
+        }
+    }
+
+    /// The `TICK` count of this circuit's SEC expansion (the `sec_depth` metric),
+    /// computed by streaming the expansion through a counting sink.
+    pub fn sec_tick_count(&self, schedule: SecSchedule) -> usize {
+        let mut counter = TickCounter::default();
+        self.expand_mpp_to_sec_into(schedule, &mut counter);
+        counter.ticks
+    }
+
+    /// Stream this circuit to `out` as stim text, lowering `MPP` rounds to the
+    /// ancilla SEC gadget first when `schedule` is `Some`. Returns the `TICK` count
+    /// of what was written. Consumes the circuit: with no SEC expansion the gates are
+    /// handed to the writer by value, so they are freed as they are rendered.
+    pub fn write_stim<W: Write>(
+        self,
+        schedule: Option<SecSchedule>,
+        out: W,
+    ) -> std::io::Result<usize> {
+        let mut writer = StimWriter::new(out);
+        match schedule {
+            Some(schedule) => self.expand_mpp_to_sec_into(schedule, &mut writer),
+            None => {
+                for gate in self.gates {
+                    writer.push(gate);
+                }
+            }
+        }
+        writer.finish()
     }
 }
 
@@ -260,20 +330,23 @@ fn max_qubit(gates: &[PhysicalGate<usize>]) -> Option<usize> {
 /// Expand the `MPP`s in a flat gate list, recursing into `REPEAT` bodies (which reuse
 /// the same ancilla pool `base..`). Consecutive `MPP`s form one syndrome round; any
 /// other gate flushes the pending round and is emitted unchanged.
-fn expand_gates(gates: &[PhysicalGate<usize>], base: usize) -> Vec<PhysicalGate<usize>> {
-    let mut out = Vec::new();
+fn expand_gates_into<S: GateSink>(gates: &[PhysicalGate<usize>], base: usize, out: &mut S) {
     let mut round: Vec<&PauliAxis<usize>> = Vec::new();
     for g in gates {
         match g {
             PhysicalGate::MPP(p) => round.push(p),
             other => {
                 if !round.is_empty() {
-                    emit_round(&round, base, &mut out);
+                    emit_round(&round, base, out);
                     round.clear();
                 }
                 match other {
                     PhysicalGate::Repeat(n, body) => {
-                        out.push(PhysicalGate::Repeat(*n, expand_gates(body, base)));
+                        // A `REPEAT` body is one round, so it is small enough to
+                        // materialize — the gate it becomes has to carry it anyway.
+                        let mut expanded = Vec::new();
+                        expand_gates_into(body, base, &mut expanded);
+                        out.push(PhysicalGate::Repeat(*n, expanded));
                     }
                     g => out.push(g.clone()),
                 }
@@ -281,16 +354,15 @@ fn expand_gates(gates: &[PhysicalGate<usize>], base: usize) -> Vec<PhysicalGate<
         }
     }
     if !round.is_empty() {
-        emit_round(&round, base, &mut out);
+        emit_round(&round, base, out);
     }
-    out
 }
 
 /// Emit one syndrome round of `checks` as TICK-layered ancilla gadgets: a reset layer
 /// (`RX` on each check's ancilla), the edge-colored controlled-Pauli layers, then a
 /// measure layer (`MX`, inverted for a negative-sign check). The j-th check uses ancilla
 /// `base + j`; measurements are emitted in check order, preserving the record stream.
-fn emit_round(checks: &[&PauliAxis<usize>], base: usize, out: &mut Vec<PhysicalGate<usize>>) {
+fn emit_round<S: GateSink>(checks: &[&PauliAxis<usize>], base: usize, out: &mut S) {
     let m = checks.len();
 
     // Reset layer.
@@ -393,6 +465,25 @@ fn flatten_gate<Q: PauliStringIndex>(
         PhysicalGate::Repeat(n, body) => {
             PhysicalGate::Repeat(*n, body.iter().map(|g| flatten_gate(g, intern)).collect())
         }
+    }
+}
+
+/// [`flatten_gate`], taking the gate by value so its record lists move instead of
+/// being cloned.
+fn into_flat_gate<Q: PauliStringIndex>(
+    gate: PhysicalGate<Q>,
+    intern: &mut impl FnMut(Q) -> usize,
+) -> PhysicalGate<usize> {
+    match gate {
+        PhysicalGate::DeclareObservable(index, recs) => {
+            PhysicalGate::DeclareObservable(index, recs)
+        }
+        PhysicalGate::DeclareDetector(recs) => PhysicalGate::DeclareDetector(recs),
+        PhysicalGate::Repeat(n, body) => PhysicalGate::Repeat(
+            n,
+            body.into_iter().map(|g| into_flat_gate(g, intern)).collect(),
+        ),
+        gate => flatten_gate(&gate, intern),
     }
 }
 
@@ -538,10 +629,185 @@ impl<Q: std::fmt::Display + PauliStringIndex> std::fmt::Display for PhysicalGate
     }
 }
 
+// ---------------------------------------------------------------------------
+// Streaming gate output
+//
+// The SEC expansion of a large circuit is far too big to hold in memory (tens of
+// millions of gates, gigabytes of stim text), so the expansion is written against
+// a *sink* rather than returning a `Vec`. `Vec<PhysicalGate<usize>>` is the
+// materializing sink used by tests and by the small-circuit paths; [`StimWriter`]
+// renders each gate to text the moment it is produced and drops it, so peak memory
+// stays at the (unexpanded) input circuit plus an output buffer.
+// ---------------------------------------------------------------------------
+
+/// A consumer of lowered, flat-qubit gates. See the module note above.
+pub(crate) trait GateSink {
+    fn push(&mut self, gate: PhysicalGate<usize>);
+    /// Named `extend_gates`, not `extend`, so that it does not collide with
+    /// `Extend::extend` on the `Vec` sink.
+    fn extend_gates<I: IntoIterator<Item = PhysicalGate<usize>>>(&mut self, gates: I) {
+        for gate in gates {
+            self.push(gate);
+        }
+    }
+}
+
+impl GateSink for Vec<PhysicalGate<usize>> {
+    fn push(&mut self, gate: PhysicalGate<usize>) {
+        Vec::push(self, gate);
+    }
+    fn extend_gates<I: IntoIterator<Item = PhysicalGate<usize>>>(&mut self, gates: I) {
+        Extend::extend(self, gates);
+    }
+}
+
+/// A sink that keeps only the `TICK` count (with `REPEAT` bodies counted by their
+/// repeat factor) — the `sec_depth` metric, obtained without materializing the
+/// expansion it measures.
+#[derive(Default)]
+pub(crate) struct TickCounter {
+    ticks: usize,
+}
+
+impl GateSink for TickCounter {
+    fn push(&mut self, gate: PhysicalGate<usize>) {
+        self.ticks += count_ticks(std::slice::from_ref(&gate));
+    }
+}
+
+/// The line-coalescing run a [`StimWriter`] is in the middle of emitting.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Run {
+    None,
+    Reset(Pauli),
+    Measure(Pauli),
+    Controlled(Pauli),
+    XCorrection,
+}
+
+/// A [`GateSink`] that streams stim text straight to an `io::Write`.
+///
+/// Produces byte-identical output to [`write_gates`] — a maximal run of same-kind
+/// single-qubit gates is coalesced onto one line — but does so from a gate *stream*,
+/// keeping only the in-progress line's state. The first I/O error is latched and
+/// returned by [`StimWriter::finish`], which also reports the `TICK` count so
+/// `--stats` needs no second pass over the expansion.
+pub(crate) struct StimWriter<W: Write> {
+    out: W,
+    run: Run,
+    indent: usize,
+    ticks: usize,
+    result: std::io::Result<()>,
+}
+
+impl<W: Write> StimWriter<W> {
+    pub(crate) fn new(out: W) -> StimWriter<W> {
+        StimWriter { out, run: Run::None, indent: 0, ticks: 0, result: Ok(()) }
+    }
+
+    /// Flush the pending line, flush the underlying writer, and report the total
+    /// `TICK` count (or the first I/O error hit along the way).
+    pub(crate) fn finish(mut self) -> std::io::Result<usize> {
+        self.end_run();
+        self.result?;
+        self.out.flush()?;
+        Ok(self.ticks)
+    }
+
+    /// Run `f` unless a previous write already failed, latching its error.
+    fn write(&mut self, f: impl FnOnce(&mut W) -> std::io::Result<()>) {
+        if self.result.is_ok() {
+            self.result = f(&mut self.out);
+        }
+    }
+
+    /// Terminate the coalesced line in progress, if any.
+    fn end_run(&mut self) {
+        if self.run != Run::None {
+            self.run = Run::None;
+            self.write(|w| writeln!(w));
+        }
+    }
+
+    /// Start (or continue) a coalesced line of kind `run` whose head is `head`.
+    fn start_run(&mut self, run: Run, head: std::fmt::Arguments<'_>) {
+        if self.run == run {
+            return;
+        }
+        self.end_run();
+        self.run = run;
+        let indent = self.indent;
+        self.write(|w| write!(w, "{:indent$}{head}", ""));
+    }
+
+    /// Emit `gate` on a line of its own, ending any coalesced line first.
+    fn standalone(&mut self, gate: &PhysicalGate<usize>) {
+        self.end_run();
+        let indent = self.indent;
+        self.write(|w| writeln!(w, "{:indent$}{gate}", ""));
+    }
+}
+
+impl<W: Write> GateSink for StimWriter<W> {
+    fn push(&mut self, gate: PhysicalGate<usize>) {
+        match gate {
+            PhysicalGate::Reset(basis, q) => {
+                self.start_run(Run::Reset(basis), format_args!("R{basis}"));
+                self.write(|w| write!(w, " {q}"));
+            }
+            PhysicalGate::Measure(basis, q, invert) => {
+                self.start_run(Run::Measure(basis), format_args!("M{basis}"));
+                let bang = if invert { "!" } else { "" };
+                self.write(|w| write!(w, " {bang}{q}"));
+            }
+            PhysicalGate::Controlled(pauli, c, t) => {
+                self.start_run(Run::Controlled(pauli), format_args!("C{pauli}"));
+                self.write(|w| write!(w, " {c} {t}"));
+            }
+            PhysicalGate::XCorrection(rec, q) => {
+                self.start_run(Run::XCorrection, format_args!("CNOT"));
+                self.write(|w| write!(w, " rec[-{rec}] {q}"));
+            }
+            PhysicalGate::Tick => {
+                self.ticks += 1;
+                self.standalone(&PhysicalGate::Tick);
+            }
+            PhysicalGate::Repeat(n, body) => {
+                self.end_run();
+                let indent = self.indent;
+                self.write(|w| writeln!(w, "{:indent$}REPEAT {n} {{", ""));
+                self.indent += 4;
+                let before = self.ticks;
+                for gate in body {
+                    self.push(gate);
+                }
+                self.end_run();
+                self.indent -= 4;
+                // The body's ticks were counted once by the loop above; the
+                // remaining n−1 iterations are accounted for here.
+                self.ticks += n.saturating_sub(1) * (self.ticks - before);
+                let indent = self.indent;
+                self.write(|w| writeln!(w, "{:indent$}}}", ""));
+            }
+            gate => self.standalone(&gate),
+        }
+    }
+}
+
 fn concatenate_circuits(
     circuits: Vec<PhysicalCircuit<MergedQubit>>,
 ) -> PhysicalCircuit<MergedQubit> {
-    let gates = circuits.into_iter().flat_map(|c| c.gates).collect();
+    // Reuse the first circuit's buffer and grow it once to the final size. A
+    // `flat_map(..).collect()` instead reallocates its way up from empty (nested
+    // iterators have no usable size hint) *and* moves every gate of the first
+    // circuit, which is the expensive one when concatenating onto an accumulator.
+    let total: usize = circuits.iter().map(|c| c.gates.len()).sum();
+    let mut circuits = circuits.into_iter();
+    let mut gates = circuits.next().map(|c| c.gates).unwrap_or_default();
+    gates.reserve(total - gates.len());
+    for c in circuits {
+        gates.extend(c.gates);
+    }
     PhysicalCircuit { gates }
 }
 
@@ -597,8 +863,11 @@ pub fn checks_to_physical_circuit(
     }
     for Deformation { checks, corrections, edge_basis } in checks.deformations.into_iter() {
         let new_subcircuit =
-            one_ppm_to_physical_circuit(checks, corrections, base_checks.clone(), rounds, edge_basis);
-        circuit = concatenate_circuits(vec![circuit, new_subcircuit]);
+            one_ppm_to_physical_circuit(checks, corrections, &base_checks, rounds, edge_basis);
+        // Append in place: concatenating into a fresh circuit each iteration would
+        // move the whole accumulated gate list once per deformation, i.e. quadratic
+        // in the deformation count with a full Pauli string riding on every `MPP`.
+        circuit.gates.extend(new_subcircuit.gates);
     }
     circuit
 }
@@ -606,11 +875,11 @@ pub fn checks_to_physical_circuit(
 fn one_ppm_to_physical_circuit(
     checks: Vec<GraphPauli<BlockKind>>,
     corrections: Vec<CorrectionSupport<BlockKind>>,
-    base_checks: Vec<GraphPauli<BlockKind>>,
+    base_checks: &[GraphPauli<BlockKind>],
     rounds: usize,
     edge_basis: Pauli,
 ) -> PhysicalCircuit<MergedQubit> {
-    let step0 = d_rounds(base_checks.clone(), rounds);
+    let step0 = d_rounds(base_checks, rounds);
     // Initialize this merge's edge qubits in the basis CONJUGATE to the vertex
     // checks' edge Pauli: |0> for X-edge vertex checks, |+> for Z-edge ones. This
     // way every vertex check `A_v = P(edges)·L_q` is individually random and only
@@ -623,7 +892,7 @@ fn one_ppm_to_physical_circuit(
     // deformations: without it, a later merge starts from the previous split's
     // leftover MZ eigenstates.
     let init = initialization(&checks, conjugate_basis(edge_basis));
-    let merge = d_rounds(checks.clone(), rounds);
+    let merge = d_rounds(&checks, rounds);
     let split = split_and_correct(&checks, &corrections, conjugate_basis(edge_basis));
     concatenate_circuits(vec![step0, init, merge, split])
 }
@@ -638,28 +907,24 @@ fn conjugate_basis(p: Pauli) -> Pauli {
     }
 }
 
-fn d_rounds(checks: Vec<GraphPauli<BlockKind>>, rounds: usize) -> PhysicalCircuit<MergedQubit> {
+fn d_rounds(checks: &[GraphPauli<BlockKind>], rounds: usize) -> PhysicalCircuit<MergedQubit> {
     let check_count = checks.len();
-    let mpp_gates: Vec<PhysicalGate<MergedQubit>> = checks
-        .into_iter()
-        .map(|check| PhysicalGate::MPP(check))
-        .collect();
-    let mut output_gates = Vec::new();
     if rounds == 0 {
-        return PhysicalCircuit {
-            gates: output_gates,
-        };
+        return PhysicalCircuit { gates: Vec::new() };
     }
     // First round establishes the reference measurements; it has no preceding
     // round to compare against, so no detectors are declared yet.
-    output_gates.extend_from_slice(&mpp_gates);
+    let mut output_gates: Vec<PhysicalGate<MergedQubit>> =
+        Vec::with_capacity(check_count + usize::from(rounds > 1));
+    output_gates.extend(checks.iter().map(|check| PhysicalGate::MPP(check.clone())));
     if rounds > 1 {
         // The remaining rounds are identical: re-measure every check and compare
         // it against its value one round earlier. The rec offsets are the same on
         // every iteration (each iteration adds `check_count` measurements), so a
         // single `REPEAT (rounds - 1)` body reproduces the unrolled circuit. The
         // first iteration's "previous round" is the reference round above.
-        let mut body = mpp_gates;
+        let mut body = Vec::with_capacity(2 * check_count);
+        body.extend_from_slice(&output_gates);
         for j in 0..check_count {
             let this = j + 1;
             let prev = check_count + j + 1;
@@ -806,7 +1071,7 @@ fn plain_memory_rounds(
     for q in qubits {
         circuit.add_gate(PhysicalGate::Reset(basis, q));
     }
-    concatenate_circuits(vec![circuit, d_rounds(base_checks.to_vec(), rounds)])
+    concatenate_circuits(vec![circuit, d_rounds(base_checks, rounds)])
 }
 
 /// Append the transversal `basis` readout to a built memory circuit and declare
@@ -1280,4 +1545,70 @@ fn solve_memory_observables(
         .collect();
 
     FrameSolve { supports: solved, determinism_detectors }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pbc::PauliString;
+
+    fn axis(sites: &[(usize, Pauli)]) -> PauliAxis<usize> {
+        PauliAxis { sign: Sign::One, pauli_string: PauliString::new(sites.to_vec()) }
+    }
+
+    /// A circuit hitting every printing path: coalesced runs of resets /
+    /// measurements / controlled-Paulis, a sign-inverted check, a `d_rounds`-shaped
+    /// `REPEAT` segment (which the LRC schedule lowers to the staggered form), and
+    /// the three kinds of record consumer.
+    fn sample() -> PhysicalCircuit<usize> {
+        let checks = [
+            axis(&[(0, Pauli::X), (1, Pauli::X), (2, Pauli::X)]),
+            axis(&[(1, Pauli::X), (2, Pauli::X), (3, Pauli::X)]),
+            axis(&[(0, Pauli::Z), (1, Pauli::Z), (2, Pauli::Z)]),
+            PauliAxis {
+                sign: Sign::NegOne,
+                pauli_string: PauliString::new(vec![
+                    (1, Pauli::Z),
+                    (2, Pauli::Z),
+                    (3, Pauli::Z),
+                ]),
+            },
+        ];
+        let m = checks.len();
+        let mut gates: Vec<PhysicalGate<usize>> =
+            (0..4).map(|q| PhysicalGate::Reset(Pauli::Z, q)).collect();
+        gates.extend(checks.iter().cloned().map(PhysicalGate::MPP));
+        let mut body: Vec<PhysicalGate<usize>> =
+            checks.iter().cloned().map(PhysicalGate::MPP).collect();
+        body.extend((0..m).map(|j| PhysicalGate::DeclareDetector(vec![j + 1, m + j + 1])));
+        gates.push(PhysicalGate::Repeat(3, body));
+        gates.push(PhysicalGate::XCorrection(2, 0));
+        gates.push(PhysicalGate::XCorrection(1, 3));
+        gates.extend((0..4).map(|q| PhysicalGate::Measure(Pauli::Z, q, q == 2)));
+        gates.push(PhysicalGate::DeclareDetector(vec![1, 4]));
+        gates.push(PhysicalGate::DeclareObservable(0, vec![1, 2]));
+        PhysicalCircuit { gates }
+    }
+
+    /// The streaming writer is a drop-in for materializing the circuit and
+    /// formatting it: same bytes, and the same TICK count `--stats` reports.
+    #[test]
+    fn streamed_output_matches_display() {
+        for schedule in [SecSchedule::Lrc, SecSchedule::Legacy] {
+            let expanded = sample().expand_mpp_to_sec(schedule);
+            let mut buf = Vec::new();
+            let ticks = sample().write_stim(Some(schedule), &mut buf).unwrap();
+            assert_eq!(String::from_utf8(buf).unwrap(), expanded.to_string());
+            assert_eq!(ticks, expanded.tick_count());
+            assert_eq!(ticks, sample().sec_tick_count(schedule));
+        }
+    }
+
+    /// The same, for the unexpanded (MPP) form written with no SEC lowering.
+    #[test]
+    fn streamed_mpp_output_matches_display() {
+        let mut buf = Vec::new();
+        sample().write_stim(None, &mut buf).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), sample().to_string());
+    }
 }
