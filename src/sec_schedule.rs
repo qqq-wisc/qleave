@@ -440,7 +440,7 @@ impl<'a> StaggeredSeg<'a> {
     /// `rec[-(m−q)]` / `rec[-(2m−q)]`, and the epilogue closes G2's last
     /// comparison with `rec[-(b−q)]` / `rec[-(m+b−q)]`. Each check gets r−1
     /// detectors, as in the MPP stream.
-    fn emit<S: GateSink>(&self, r: usize, out: &mut S, map: &mut Vec<usize>) {
+    fn emit<S: GateSink>(&self, r: usize, out: &mut S, map: &mut RecordMap) {
         let (m, a, b) = (self.m, self.a, self.b);
         let g1_detectors = || -> Vec<Gate> {
             (0..a).map(|p| PhysicalGate::DeclareDetector(vec![a - p, m + a - p])).collect()
@@ -560,9 +560,97 @@ fn repeat_matches(body: &[Gate], checks: &[&PauliAxis<usize>]) -> bool {
     true
 }
 
-fn extend_identity(map: &mut Vec<usize>, n: usize) {
-    let s = map.len();
-    map.extend(s..s + n);
+fn extend_identity(map: &mut RecordMap, n: usize) {
+    map.extend_identity(n);
+}
+
+/// The LRC expansion's old→new record correspondence: `map[i]` is the new index of
+/// the record that was `i`-th before the schedule permuted it, and `map.len()` is
+/// the running record count both spaces share.
+///
+/// Two representations, because the two callers have very different needs. The
+/// whole-circuit expansion can be handed frame-solver observables, whose `rec[-k]`
+/// reach back arbitrarily far, so it has to keep every entry. The streaming lowerer
+/// cannot: on `mod_adder_1024` the full history is ~3.4 billion entries (~27 GB),
+/// which was the last thing keeping `--stats` and `--syndrome-extraction-circuits`
+/// memory-bound. It has no observables by construction, and its only `rewrite`
+/// consumer is the split's `XCorrection`s reaching back over that same split's edge
+/// measurements, so a fixed window suffices — with a hard bound check, since being
+/// wrong here would silently rewrite a `rec[-k]` to the wrong record.
+pub(crate) enum RecordMap {
+    /// Every record retained.
+    Full(Vec<usize>),
+    /// Only the most recent `ring.len()` records, addressed by old index modulo the
+    /// ring size; `total` is the true record count that `len()` reports.
+    Windowed { ring: Vec<usize>, total: usize },
+}
+
+impl RecordMap {
+    pub(crate) fn full() -> RecordMap {
+        RecordMap::Full(Vec::new())
+    }
+
+    /// A map that remembers only the last `window` records. `window` must exceed the
+    /// largest `rec[-k]` the stream will ever resolve.
+    pub(crate) fn windowed(window: usize) -> RecordMap {
+        RecordMap::Windowed { ring: vec![0; window.max(1)], total: 0 }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            RecordMap::Full(all) => all.len(),
+            RecordMap::Windowed { total, .. } => *total,
+        }
+    }
+
+    fn get(&self, old_index: usize) -> usize {
+        match self {
+            RecordMap::Full(all) => all[old_index],
+            RecordMap::Windowed { ring, total } => {
+                assert!(
+                    total - old_index <= ring.len(),
+                    "LRC record look-back of {} exceeds the {}-record window; the \
+                     streaming lowerer sized it from the largest syndrome round, so \
+                     a `rec[-k]` reaching further back means that bound is wrong",
+                    total - old_index,
+                    ring.len(),
+                );
+                ring[old_index % ring.len()]
+            }
+        }
+    }
+
+    fn push(&mut self, new_index: usize) {
+        match self {
+            RecordMap::Full(all) => all.push(new_index),
+            RecordMap::Windowed { ring, total } => {
+                let w = ring.len();
+                ring[*total % w] = new_index;
+                *total += 1;
+            }
+        }
+    }
+
+    /// Append `n` records that the schedule left in place.
+    fn extend_identity(&mut self, n: usize) {
+        match self {
+            RecordMap::Full(all) => {
+                let s = all.len();
+                all.extend(s..s + n);
+            }
+            RecordMap::Windowed { ring, total } => {
+                // Only the last `w` of the `n` entries can survive in the ring, and a
+                // syndrome round contributes its whole unrolled `r * m` at once, so
+                // writing all of them would be the dominant cost of the expansion.
+                let w = ring.len();
+                let start = *total;
+                for i in (start + n.saturating_sub(w))..(start + n) {
+                    ring[i % w] = i;
+                }
+                *total += n;
+            }
+        }
+    }
 }
 
 /// Number of measurement records a gate sequence produces (`REPEAT` bodies
@@ -617,7 +705,7 @@ fn expand_sequential_only(gates: &[Gate], base: usize) -> Vec<Gate> {
 /// strictly in order and never read back, so the writing path can stream it to
 /// disk instead of holding it (see [`crate::checks_to_physical_circuit::StimWriter`]).
 pub(crate) fn expand_gates_lrc_into<S: GateSink>(gates: &[Gate], base: usize, out: &mut S) {
-    let mut map: Vec<usize> = Vec::new();
+    let mut map = RecordMap::full();
     expand_gates_lrc_with_map(gates, base, out, &mut map);
 }
 
@@ -631,13 +719,13 @@ pub(crate) fn expand_gates_lrc_with_map<S: GateSink>(
     gates: &[Gate],
     base: usize,
     out: &mut S,
-    map: &mut Vec<usize>,
+    map: &mut RecordMap,
 ) {
-    // Old→new record permutation; `map.len()` doubles as the running old-record
-    // count, which equals the running new-record count everywhere outside a
-    // segment (both schedules preserve per-segment record totals).
-    let rewrite = |map: &[usize], recs: &[usize]| -> Vec<usize> {
-        recs.iter().map(|&k| map.len() - map[map.len() - k]).collect()
+    // `map.len()` doubles as the running old-record count, which equals the running
+    // new-record count everywhere outside a segment (both schedules preserve
+    // per-segment record totals).
+    let rewrite = |map: &RecordMap, recs: &[usize]| -> Vec<usize> {
+        recs.iter().map(|&k| map.len() - map.get(map.len() - k)).collect()
     };
 
     let mut i = 0;

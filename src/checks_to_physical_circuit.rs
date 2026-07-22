@@ -946,6 +946,39 @@ fn merged_qubit_count(checks: &DeformedCheckSequence) -> usize {
     qubits.len()
 }
 
+/// How far back this circuit's `rec[-k]` rewrites can reach, and so how many records
+/// the streaming LRC expansion has to retain.
+///
+/// The only rewritten rec-consumer on the streaming path is the split's
+/// `XCorrection`s, which reach back over that same split's edge measurements — the
+/// round detectors of both schedules are emitted directly in new-record space and
+/// never go through the rewrite, and the frame-solver observables that *can* reach
+/// arbitrarily far exist only on the materializing path. The round sizes are folded
+/// in anyway so the bound survives a future round gaining a rewritten detector, and
+/// a flat margin covers the rest: an entry costs 8 bytes, so over-provisioning here
+/// is free next to getting it wrong (which [`RecordMap::get`] turns into a panic
+/// rather than a silently misdirected record).
+fn record_window(checks: &DeformedCheckSequence) -> usize {
+    let mut widest = checks.base_checks.len();
+    let mut seen: std::collections::HashSet<*const Deformation> = Default::default();
+    for deformation in &checks.deformations {
+        if !seen.insert(std::rc::Rc::as_ptr(deformation)) {
+            continue;
+        }
+        widest = widest.max(deformation.checks.len());
+        let edge_qubits = deformation
+            .checks
+            .iter()
+            .flat_map(|p| p.pauli_string.iter())
+            .map(|&(q, _)| q)
+            .filter(|q| matches!(q, MergedCodeQubit::EdgeQubit(_)))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        widest = widest.max(edge_qubits);
+    }
+    4 * widest + 65536
+}
+
 /// The per-chunk half of the streaming lowering: flatten a chunk of merged gates
 /// through an interner that persists across chunks, optionally SEC-expand it, and
 /// hand the result to `sink` — accumulating the `--stats` counters that can only be
@@ -955,8 +988,10 @@ struct ChunkPipe<S: GateSink> {
     /// Reused across chunks so the per-deformation flattening does not reallocate.
     flat: Vec<PhysicalGate<usize>>,
     /// The LRC expansion's old→new record map, carried across chunks so a later
-    /// chunk's `rec[-k]` still resolves against earlier records.
-    lrc_map: Vec<usize>,
+    /// chunk's `rec[-k]` still resolves against earlier records. Windowed: keeping
+    /// every record is what made `--stats` and `--syndrome-extraction-circuits`
+    /// memory-bound long after the gates themselves stopped being.
+    lrc_map: crate::sec_schedule::RecordMap,
     schedule: Option<SecSchedule>,
     ancilla_base: usize,
     syndrome_cycles: usize,
@@ -965,11 +1000,16 @@ struct ChunkPipe<S: GateSink> {
 }
 
 impl<S: GateSink> ChunkPipe<S> {
-    fn new(schedule: Option<SecSchedule>, ancilla_base: usize, sink: S) -> ChunkPipe<S> {
+    fn new(
+        schedule: Option<SecSchedule>,
+        ancilla_base: usize,
+        record_window: usize,
+        sink: S,
+    ) -> ChunkPipe<S> {
         ChunkPipe {
             ids: BTreeMap::new(),
             flat: Vec::new(),
-            lrc_map: Vec::new(),
+            lrc_map: crate::sec_schedule::RecordMap::windowed(record_window),
             schedule,
             ancilla_base,
             syndrome_cycles: 0,
@@ -1048,7 +1088,12 @@ pub fn stream_stim<W: Write>(
     schedule: Option<SecSchedule>,
     out: W,
 ) -> std::io::Result<(usize, CircuitStats)> {
-    let mut pipe = ChunkPipe::new(schedule, merged_qubit_count(checks), StimWriter::new(out));
+    let mut pipe = ChunkPipe::new(
+        schedule,
+        merged_qubit_count(checks),
+        record_window(checks),
+        StimWriter::new(out),
+    );
     for_each_deformation_chunk(checks, rounds, |gates| pipe.push_chunk(gates));
     let (code_qubits, edge_qubits) = pipe.qubit_counts();
     let stats = CircuitStats {
@@ -1074,6 +1119,7 @@ pub fn stream_sec_tick_count(
     let mut pipe = ChunkPipe::new(
         Some(schedule),
         merged_qubit_count(checks),
+        record_window(checks),
         TickCounter::default(),
     );
     for_each_deformation_chunk(checks, rounds, |gates| pipe.push_chunk(gates));
