@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::rc::Rc;
 
 use crate::{
     checks_to_physical_circuit::PhysicalGate::DeclareObservable,
@@ -886,10 +887,28 @@ pub fn checks_to_physical_circuit(
 /// — and no `REPEAT`-to-reference-round pairing — ever straddles a chunk boundary.
 /// Consumers that track round structure or look ahead within a round (the SEC
 /// expansions) therefore see exactly what they would have seen on the whole circuit.
+/// Consumer of the chunk stream produced by [`for_each_deformation_chunk`].
+trait ChunkVisitor {
+    /// Asked before a deformation is lowered. Returning `false` skips the build
+    /// entirely.
+    ///
+    /// The support cache leaves the same `Rc` repeated across tens of thousands of
+    /// measurements — on `mod_adder_1024`, 26026 of 26226 — so a consumer whose
+    /// answer depends only on *which* deformation this is, and not on where it sits
+    /// in the stream, can serve the repeats from a memo and skip the lowering
+    /// altogether. Consumers that have to emit something per occurrence (anything
+    /// writing the circuit out) keep the default and see every chunk.
+    fn wants(&mut self, _deformation: &Rc<Deformation>) -> bool {
+        true
+    }
+
+    fn visit(&mut self, gates: &[PhysicalGate<MergedQubit>]);
+}
+
 fn for_each_deformation_chunk(
     checks: &DeformedCheckSequence,
     rounds: usize,
-    mut emit: impl FnMut(&[PhysicalGate<MergedQubit>]),
+    visitor: &mut impl ChunkVisitor,
 ) {
     let qubits: Vec<MergedQubit> = checks
         .base_checks
@@ -903,9 +922,12 @@ fn for_each_deformation_chunk(
         .into_iter()
         .map(|q| PhysicalGate::Reset(Pauli::Z, q))
         .collect();
-    emit(&resets);
+    visitor.visit(&resets);
 
     for deformation in &checks.deformations {
+        if !visitor.wants(deformation) {
+            continue;
+        }
         let Deformation { checks: deformed, corrections, edge_basis } = &**deformation;
         let sub = one_ppm_to_physical_circuit(
             deformed,
@@ -914,7 +936,7 @@ fn for_each_deformation_chunk(
             rounds,
             *edge_basis,
         );
-        emit(&sub.gates);
+        visitor.visit(&sub.gates);
     }
 }
 
@@ -1070,6 +1092,72 @@ impl<S: GateSink> ChunkPipe<S> {
     }
 }
 
+/// Writing consumers take every chunk: the same deformation still has to be emitted
+/// once per occurrence, however often it repeats.
+impl<S: GateSink> ChunkVisitor for ChunkPipe<S> {
+    fn visit(&mut self, gates: &[PhysicalGate<MergedQubit>]) {
+        self.push_chunk(gates);
+    }
+}
+
+/// Tick-counting consumer that pays for each *distinct* deformation once.
+///
+/// `sec_depth` is a sum over chunks of a quantity that depends only on the chunk's
+/// own gates: the SEC expansion emits `TICK`s from the layer structure of the round
+/// in front of it, and the one piece of state it carries across chunks — the record
+/// map — feeds only `DeclareDetector` / `XCorrection` rewrites, neither of which
+/// contributes a tick. So a repeated deformation contributes exactly what it did the
+/// first time, and both its lowering and its expansion can be skipped.
+///
+/// Skipping leaves the record map behind the true record count, which is harmless
+/// here: the window bound [`RecordMap::get`] asserts is `k`, taken from the gate
+/// being rewritten rather than from the map, and stored indices never exceed the
+/// running total, so neither the assert nor the subtraction can trip. The rewritten
+/// offsets themselves come out wrong — and are then discarded with the gates.
+struct MemoizedTicks {
+    pipe: ChunkPipe<TickCounter>,
+    /// Ticks contributed by one occurrence of each distinct deformation.
+    per_deformation: std::collections::HashMap<*const Deformation, usize>,
+    /// The deformation whose gates the next `visit` will carry, if it is new.
+    pending: Option<*const Deformation>,
+    ticks: usize,
+}
+
+impl MemoizedTicks {
+    fn new(pipe: ChunkPipe<TickCounter>) -> MemoizedTicks {
+        MemoizedTicks {
+            pipe,
+            per_deformation: Default::default(),
+            pending: None,
+            ticks: 0,
+        }
+    }
+}
+
+impl ChunkVisitor for MemoizedTicks {
+    fn wants(&mut self, deformation: &Rc<Deformation>) -> bool {
+        let key = Rc::as_ptr(deformation);
+        if let Some(&ticks) = self.per_deformation.get(&key) {
+            self.ticks += ticks;
+            return false;
+        }
+        self.pending = Some(key);
+        true
+    }
+
+    fn visit(&mut self, gates: &[PhysicalGate<MergedQubit>]) {
+        let before = self.pipe.sink.ticks;
+        self.pipe.push_chunk(gates);
+        let emitted = self.pipe.sink.ticks - before;
+        self.ticks += emitted;
+        // `None` for the leading reset chunk, which belongs to no deformation and
+        // occurs once anyway.
+        if let Some(key) = self.pending.take() {
+            self.per_deformation.insert(key, emitted);
+        }
+    }
+}
+
 /// Lower `checks` straight to stim text without ever materializing the circuit,
 /// returning the `TICK` count of what was written alongside the `--stats` metrics
 /// gathered on the way. The streaming counterpart of
@@ -1094,7 +1182,7 @@ pub fn stream_stim<W: Write>(
         record_window(checks),
         StimWriter::new(out),
     );
-    for_each_deformation_chunk(checks, rounds, |gates| pipe.push_chunk(gates));
+    for_each_deformation_chunk(checks, rounds, &mut pipe);
     let (code_qubits, edge_qubits) = pipe.qubit_counts();
     let stats = CircuitStats {
         code_qubits,
@@ -1122,8 +1210,9 @@ pub fn stream_sec_tick_count(
         record_window(checks),
         TickCounter::default(),
     );
-    for_each_deformation_chunk(checks, rounds, |gates| pipe.push_chunk(gates));
-    pipe.sink.ticks
+    let mut counter = MemoizedTicks::new(pipe);
+    for_each_deformation_chunk(checks, rounds, &mut counter);
+    counter.ticks
 }
 
 fn one_ppm_to_physical_circuit(
