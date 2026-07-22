@@ -617,10 +617,25 @@ fn expand_sequential_only(gates: &[Gate], base: usize) -> Vec<Gate> {
 /// strictly in order and never read back, so the writing path can stream it to
 /// disk instead of holding it (see [`crate::checks_to_physical_circuit::StimWriter`]).
 pub(crate) fn expand_gates_lrc_into<S: GateSink>(gates: &[Gate], base: usize, out: &mut S) {
+    let mut map: Vec<usize> = Vec::new();
+    expand_gates_lrc_with_map(gates, base, out, &mut map);
+}
+
+/// [`expand_gates_lrc_into`] over a caller-owned record map, so a circuit can be
+/// expanded in consecutive chunks instead of all at once. `map` carries the
+/// old→new record correspondence across calls, which is what lets a later chunk's
+/// `rec[-k]` still resolve against records emitted by an earlier one. Splitting is
+/// only sound where no `MPP` run straddles the boundary — the streaming lowerer
+/// cuts between deformations, each of which ends in the split's `M`/`CNOT` gates.
+pub(crate) fn expand_gates_lrc_with_map<S: GateSink>(
+    gates: &[Gate],
+    base: usize,
+    out: &mut S,
+    map: &mut Vec<usize>,
+) {
     // Old→new record permutation; `map.len()` doubles as the running old-record
     // count, which equals the running new-record count everywhere outside a
     // segment (both schedules preserve per-segment record totals).
-    let mut map: Vec<usize> = Vec::new();
     let rewrite = |map: &[usize], recs: &[usize]| -> Vec<usize> {
         recs.iter().map(|&k| map.len() - map[map.len() - k]).collect()
     };
@@ -660,7 +675,7 @@ pub(crate) fn expand_gates_lrc_into<S: GateSink>(gates: &[Gate], base: usize, ou
                     );
                 }
                 if n_classes == 2 && r >= 2 {
-                    StaggeredSeg::new(&checks, classes, base).emit(r, out, &mut map);
+                    StaggeredSeg::new(&checks, classes, base).emit(r, out, map);
                 } else {
                     // Sequential: reference round, then (if matched) a body of
                     // the same round with the original detectors — offsets are
@@ -674,32 +689,32 @@ pub(crate) fn expand_gates_lrc_into<S: GateSink>(gates: &[Gate], base: usize, ou
                         );
                         out.push(PhysicalGate::Repeat(n, body));
                     }
-                    extend_identity(&mut map, r * m);
+                    extend_identity(map, r * m);
                 }
                 i = j + matched_repeat.map_or(0, |_| 1);
             }
             PhysicalGate::Measure(basis, q, invert) => {
-                extend_identity(&mut map, 1);
+                extend_identity(map, 1);
                 out.push(PhysicalGate::Measure(*basis, *q, *invert));
                 i += 1;
             }
             PhysicalGate::XCorrection(k, q) => {
-                out.push(PhysicalGate::XCorrection(rewrite(&map, &[*k])[0], *q));
+                out.push(PhysicalGate::XCorrection(rewrite(map, &[*k])[0], *q));
                 i += 1;
             }
             PhysicalGate::DeclareDetector(recs) => {
-                out.push(PhysicalGate::DeclareDetector(rewrite(&map, recs)));
+                out.push(PhysicalGate::DeclareDetector(rewrite(map, recs)));
                 i += 1;
             }
             PhysicalGate::DeclareObservable(idx, recs) => {
-                out.push(PhysicalGate::DeclareObservable(*idx, rewrite(&map, recs)));
+                out.push(PhysicalGate::DeclareObservable(*idx, rewrite(map, recs)));
                 i += 1;
             }
             PhysicalGate::Repeat(n, body) => {
                 // A REPEAT not attached to a reference round (does not occur
                 // today): lower it order-preservingly so in-body offsets and
                 // the identity record map stay valid.
-                extend_identity(&mut map, n * records_in(body));
+                extend_identity(map, n * records_in(body));
                 out.push(PhysicalGate::Repeat(*n, expand_sequential_only(body, base)));
                 i += 1;
             }

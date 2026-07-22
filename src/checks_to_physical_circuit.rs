@@ -861,9 +861,10 @@ pub fn checks_to_physical_circuit(
     for qubit in qubits {
         circuit.add_gate(PhysicalGate::Reset(Pauli::Z, qubit));
     }
-    for Deformation { checks, corrections, edge_basis } in checks.deformations.into_iter() {
+    for deformation in checks.deformations.iter() {
+        let Deformation { checks, corrections, edge_basis } = &**deformation;
         let new_subcircuit =
-            one_ppm_to_physical_circuit(checks, corrections, &base_checks, rounds, edge_basis);
+            one_ppm_to_physical_circuit(checks, corrections, &base_checks, rounds, *edge_basis);
         // Append in place: concatenating into a fresh circuit each iteration would
         // move the whole accumulated gate list once per deformation, i.e. quadratic
         // in the deformation count with a full Pauli string riding on every `MPP`.
@@ -872,9 +873,216 @@ pub fn checks_to_physical_circuit(
     circuit
 }
 
+/// Walk the lowering of `checks` one deformation at a time, handing each chunk of
+/// merged-qubit gates to `emit` and dropping it before the next is built.
+///
+/// Chunking exists so the caller never has to hold the whole circuit: each
+/// deformation re-emits `step0` (a full `rounds`-deep pass over *every* base check),
+/// so the gates a deformation expands to outweigh the deformation itself by an order
+/// of magnitude, and on a large circuit their sum is what exhausts memory.
+///
+/// The cut points are deliberate. A syndrome round is a maximal run of consecutive
+/// `MPP`s, and every deformation ends in its split's `M` / `CNOT` gates, so no round
+/// — and no `REPEAT`-to-reference-round pairing — ever straddles a chunk boundary.
+/// Consumers that track round structure or look ahead within a round (the SEC
+/// expansions) therefore see exactly what they would have seen on the whole circuit.
+fn for_each_deformation_chunk(
+    checks: &DeformedCheckSequence,
+    rounds: usize,
+    mut emit: impl FnMut(&[PhysicalGate<MergedQubit>]),
+) {
+    let qubits: Vec<MergedQubit> = checks
+        .base_checks
+        .iter()
+        .flat_map(|p| p.pauli_string.iter())
+        .map(|&(q, _)| q)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let resets: Vec<PhysicalGate<MergedQubit>> = qubits
+        .into_iter()
+        .map(|q| PhysicalGate::Reset(Pauli::Z, q))
+        .collect();
+    emit(&resets);
+
+    for deformation in &checks.deformations {
+        let Deformation { checks: deformed, corrections, edge_basis } = &**deformation;
+        let sub = one_ppm_to_physical_circuit(
+            deformed,
+            corrections,
+            &checks.base_checks,
+            rounds,
+            *edge_basis,
+        );
+        emit(&sub.gates);
+    }
+}
+
+/// The number of distinct merged qubits the streamed circuit will touch — equivalently
+/// the size of the flat id space [`PhysicalCircuit::flatten`] hands out, and so the
+/// first free ancilla id the SEC expansion needs *before* the first gate is written.
+///
+/// Read off the checks rather than off the gate stream, and over the *distinct*
+/// deformations only (the support cache leaves the same `Rc` repeated many times), so
+/// it costs a pass over a few hundred deformations instead of a second full lowering.
+/// Only the count is taken from here: the ids themselves are still assigned in order
+/// of first appearance while streaming, which is what keeps the output identical to
+/// the materializing path.
+fn merged_qubit_count(checks: &DeformedCheckSequence) -> usize {
+    let mut qubits: std::collections::BTreeSet<MergedQubit> = Default::default();
+    for p in &checks.base_checks {
+        qubits.extend(p.pauli_string.iter().map(|&(q, _)| q));
+    }
+    let mut seen: std::collections::HashSet<*const Deformation> = Default::default();
+    for deformation in &checks.deformations {
+        if !seen.insert(std::rc::Rc::as_ptr(deformation)) {
+            continue;
+        }
+        for p in &deformation.checks {
+            qubits.extend(p.pauli_string.iter().map(|&(q, _)| q));
+        }
+        qubits.extend(deformation.corrections.iter().map(|c| c.qubit));
+    }
+    qubits.len()
+}
+
+/// The per-chunk half of the streaming lowering: flatten a chunk of merged gates
+/// through an interner that persists across chunks, optionally SEC-expand it, and
+/// hand the result to `sink` — accumulating the `--stats` counters that can only be
+/// read off the merged, pre-expansion form on the way past.
+struct ChunkPipe<S: GateSink> {
+    ids: BTreeMap<MergedQubit, usize>,
+    /// Reused across chunks so the per-deformation flattening does not reallocate.
+    flat: Vec<PhysicalGate<usize>>,
+    /// The LRC expansion's old→new record map, carried across chunks so a later
+    /// chunk's `rec[-k]` still resolves against earlier records.
+    lrc_map: Vec<usize>,
+    schedule: Option<SecSchedule>,
+    ancilla_base: usize,
+    syndrome_cycles: usize,
+    sec_ancilla_pool: usize,
+    sink: S,
+}
+
+impl<S: GateSink> ChunkPipe<S> {
+    fn new(schedule: Option<SecSchedule>, ancilla_base: usize, sink: S) -> ChunkPipe<S> {
+        ChunkPipe {
+            ids: BTreeMap::new(),
+            flat: Vec::new(),
+            lrc_map: Vec::new(),
+            schedule,
+            ancilla_base,
+            syndrome_cycles: 0,
+            sec_ancilla_pool: 0,
+            sink,
+        }
+    }
+
+    fn push_chunk(&mut self, gates: &[PhysicalGate<MergedQubit>]) {
+        // The whole chunking scheme rests on this: a syndrome round is a maximal run
+        // of consecutive `MPP`s, so a chunk that ended mid-run would be expanded — and
+        // counted — as two rounds where the materialized circuit has one. Deformations
+        // normally end in their split's `M`/`CNOT` gates, but `split_and_correct` emits
+        // nothing for a deformation whose checks touch no edge qubit, which at
+        // `rounds == 1` (no trailing `REPEAT`) would leave the merge's `MPP`s last.
+        debug_assert!(
+            !matches!(gates.last(), Some(PhysicalGate::MPP(_))),
+            "chunk ends mid-syndrome-round; splitting here would regroup the round",
+        );
+        // Both metrics count maximal `MPP` runs, which never span a chunk (see
+        // `for_each_deformation_chunk`), so per-chunk accumulation is exact.
+        self.syndrome_cycles += count_syndrome_rounds(gates);
+        self.sec_ancilla_pool = self.sec_ancilla_pool.max(widest_syndrome_round(gates));
+
+        self.flat.clear();
+        let ids = &mut self.ids;
+        let mut intern = |q: MergedQubit| -> usize {
+            let next = ids.len();
+            *ids.entry(q).or_insert(next)
+        };
+        self.flat
+            .extend(gates.iter().map(|g| flatten_gate(g, &mut intern)));
+
+        match self.schedule {
+            None => {
+                for gate in self.flat.drain(..) {
+                    self.sink.push(gate);
+                }
+            }
+            Some(SecSchedule::Lrc) => crate::sec_schedule::expand_gates_lrc_with_map(
+                &self.flat,
+                self.ancilla_base,
+                &mut self.sink,
+                &mut self.lrc_map,
+            ),
+            Some(SecSchedule::Legacy) => {
+                expand_gates_into(&self.flat, self.ancilla_base, &mut self.sink)
+            }
+        }
+    }
+
+    /// The qubit-count metrics, available once every chunk has been interned.
+    fn qubit_counts(&self) -> (usize, usize) {
+        self.ids.keys().fold((0, 0), |(code, edge), q| match q {
+            MergedCodeQubit::EdgeQubit(_) => (code, edge + 1),
+            MergedCodeQubit::CodeQubit { .. } => (code + 1, edge),
+        })
+    }
+}
+
+/// Lower `checks` straight to stim text without ever materializing the circuit,
+/// returning the `TICK` count of what was written alongside the `--stats` metrics
+/// gathered on the way. The streaming counterpart of
+/// [`checks_to_physical_circuit`] + [`PhysicalCircuit::into_flat`] +
+/// [`PhysicalCircuit::write_stim`], and byte-for-byte equivalent to that chain.
+///
+/// `sec_depth` is left at zero: with `schedule` set it is the returned tick count,
+/// and without it the caller has to decide whether the metric is worth a second
+/// pass (see [`stream_sec_tick_count`]).
+///
+/// Only the observable-free path is served here; a memory experiment's observables
+/// come from a whole-circuit frame solve that has nothing to stream against.
+pub fn stream_stim<W: Write>(
+    checks: &DeformedCheckSequence,
+    rounds: usize,
+    schedule: Option<SecSchedule>,
+    out: W,
+) -> std::io::Result<(usize, CircuitStats)> {
+    let mut pipe = ChunkPipe::new(schedule, merged_qubit_count(checks), StimWriter::new(out));
+    for_each_deformation_chunk(checks, rounds, |gates| pipe.push_chunk(gates));
+    let (code_qubits, edge_qubits) = pipe.qubit_counts();
+    let stats = CircuitStats {
+        code_qubits,
+        edge_qubits,
+        sec_ancilla_pool: pipe.sec_ancilla_pool,
+        syndrome_cycles: pipe.syndrome_cycles,
+        sec_depth: 0,
+    };
+    let ticks = pipe.sink.finish()?;
+    Ok((ticks, stats))
+}
+
+/// The `sec_depth` of `checks`'s SEC lowering, counted by streaming the expansion
+/// through a counting sink. Needed only when `--stats` is asked for without
+/// `--syndrome-extraction-circuits`, where the written circuit is not the expanded
+/// one; it regenerates the gate stream, so it costs time but holds nothing.
+pub fn stream_sec_tick_count(
+    checks: &DeformedCheckSequence,
+    rounds: usize,
+    schedule: SecSchedule,
+) -> usize {
+    let mut pipe = ChunkPipe::new(
+        Some(schedule),
+        merged_qubit_count(checks),
+        TickCounter::default(),
+    );
+    for_each_deformation_chunk(checks, rounds, |gates| pipe.push_chunk(gates));
+    pipe.sink.ticks
+}
+
 fn one_ppm_to_physical_circuit(
-    checks: Vec<GraphPauli<BlockKind>>,
-    corrections: Vec<CorrectionSupport<BlockKind>>,
+    checks: &[GraphPauli<BlockKind>],
+    corrections: &[CorrectionSupport<BlockKind>],
     base_checks: &[GraphPauli<BlockKind>],
     rounds: usize,
     edge_basis: Pauli,
@@ -891,9 +1099,9 @@ fn one_ppm_to_physical_circuit(
     // The explicit reset also matters because edge-qubit ids are reused across
     // deformations: without it, a later merge starts from the previous split's
     // leftover MZ eigenstates.
-    let init = initialization(&checks, conjugate_basis(edge_basis));
-    let merge = d_rounds(&checks, rounds);
-    let split = split_and_correct(&checks, &corrections, conjugate_basis(edge_basis));
+    let init = initialization(checks, conjugate_basis(edge_basis));
+    let merge = d_rounds(checks, rounds);
+    let split = split_and_correct(checks, corrections, conjugate_basis(edge_basis));
     concatenate_circuits(vec![step0, init, merge, split])
 }
 
@@ -938,7 +1146,7 @@ fn d_rounds(checks: &[GraphPauli<BlockKind>], rounds: usize) -> PhysicalCircuit<
 }
 
 fn initialization(
-    checks: &Vec<GraphPauli<BlockKind>>,
+    checks: &[GraphPauli<BlockKind>],
     basis: Pauli,
 ) -> PhysicalCircuit<MergedQubit> {
     let strings = checks.iter().map(|p| &p.pauli_string);
@@ -969,8 +1177,8 @@ fn initialization(
 /// the resulting records to stay deterministic is determined later by the
 /// symbolic frame solver, not annotated here.
 fn split_and_correct(
-    checks: &Vec<GraphPauli<BlockKind>>,
-    corrections: &Vec<CorrectionSupport<BlockKind>>,
+    checks: &[GraphPauli<BlockKind>],
+    corrections: &[CorrectionSupport<BlockKind>],
     split_basis: Pauli,
 ) -> PhysicalCircuit<MergedQubit> {
     let strings = checks.iter().map(|p| &p.pauli_string);

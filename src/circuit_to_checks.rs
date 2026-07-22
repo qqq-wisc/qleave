@@ -13,11 +13,17 @@ use std::collections::hash_map::Entry;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 
 #[derive(Clone)]
 pub struct DeformedCheckSequence{
     pub base_checks : Vec<GraphPauli<BlockKind>>,
-    pub deformations : Vec<Deformation>,
+    /// One entry per measurement, in circuit order. Shared rather than owned: the
+    /// support cache below routinely resolves tens of thousands of measurements to
+    /// the same few hundred distinct deformations, and a `Deformation` carries the
+    /// whole merged-code check set (megabytes), so cloning one per repeat is what
+    /// used to dominate this stage's memory.
+    pub deformations : Vec<Rc<Deformation>>,
 }
 
 /// One logical Pauli measurement lowered to merged-code checks: the deformed
@@ -722,7 +728,7 @@ fn physical_supports_to_stabilizer_sets(
     distance: usize,
     supports: &[PhysicalSupport],
     config: &SurgeryGraphConfig,
-) -> Vec<Deformation> {
+) -> Vec<Rc<Deformation>> {
     let processor_stabilizers = &codes.processor.stabilizers;
     let memory_stabilizers = &codes.memory.stabilizers;
     let magic_stabilizers = &codes.magic.stabilizers;
@@ -753,7 +759,7 @@ fn physical_supports_to_stabilizer_sets(
     // are fixed for this call), so memoize on the support: circuits routinely
     // measure the same Pauli product many times, and surgery-graph construction
     // dominates this pass.
-    let mut cache: HashMap<&PhysicalSupport, Deformation> = HashMap::new();
+    let mut cache: HashMap<&PhysicalSupport, Rc<Deformation>> = HashMap::new();
     // Beneath that, per-block graphs are memoized separately (see
     // [`SurgeryCaches`]), so measurements that share only one side — e.g. the
     // magic piece of every T-gadget — still reuse the expensive graph
@@ -772,7 +778,7 @@ fn physical_supports_to_stabilizer_sets(
                 eprintln!(
                     "[surgery_graph] full cache hit! I've seen this exact Pauli product before."
                 );
-                stabilizers.push(hit.clone());
+                stabilizers.push(Rc::clone(hit));
                 continue;
             }
         }
@@ -819,8 +825,9 @@ fn physical_supports_to_stabilizer_sets(
                 &mut graph_cache,
             ),
         };
+        let deformation = Rc::new(deformation);
         if config.caching {
-            cache.insert(support, deformation.clone());
+            cache.insert(support, Rc::clone(&deformation));
         }
         stabilizers.push(deformation);
     }

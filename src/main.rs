@@ -6,11 +6,11 @@ use qleave::{
     },
     checks_to_physical_circuit::{
         CircuitStats, MergedQubit, PhysicalCircuit, compile_memory_experiment,
-        compile_plain_memory_experiment,
+        compile_plain_memory_experiment, stream_sec_tick_count, stream_stim,
     },
     circuit::Circuit,
     circuit_to_checks::{
-        CodeData, pauli_product_circuit_to_physical_supports,
+        CodeData, DeformedCheckSequence, pauli_product_circuit_to_physical_supports,
         physical_supports_to_stabilizer_checks,
     },
     compile::{compile, compile_explicit_clifford, compile_explicit_clifford_steps, compile_steps},
@@ -482,18 +482,65 @@ fn run_to_physical(cli: &Cli, circuit_path: &Path, circuit: Circuit) {
         cli.distance,
         &cli.surgery_graph_config(),
     );
-    let memory = compile_memory_experiment(
-        checks,
-        cli.distance,
-        &codes,
-        cli.basis.into(),
-        !cli.no_memory_observables,
-    );
     let output_path = cli.output.clone().unwrap_or_else(|| {
         let stem = circuit_path.file_stem().unwrap_or_default();
         PathBuf::from(stem).with_extension("stim")
     });
+    // Without observables the circuit is a pure function of the check sequence, so it
+    // can be lowered and written in one streaming pass and never has to exist in full.
+    // The observable-bearing path cannot: its records come from a frame solve over the
+    // whole circuit.
+    if cli.no_memory_observables {
+        stream_physical(&checks, cli, &output_path, "physical circuit");
+        return;
+    }
+    let memory = compile_memory_experiment(checks, cli.distance, &codes, cli.basis.into(), true);
     write_physical(memory, cli, &output_path, "physical circuit");
+}
+
+/// `--no-memory-observables` counterpart of [`write_physical`]: lower the check
+/// sequence and write it as stim text in a single streaming pass, so peak memory
+/// stays at roughly one deformation's expansion instead of the whole circuit's.
+///
+/// `sec_depth` is free when the SEC expansion is what gets written; otherwise it
+/// costs a second pass over the (regenerated, never retained) gate stream, which is
+/// the same trade the materializing path makes.
+fn stream_physical(checks: &DeformedCheckSequence, cli: &Cli, output_path: &Path, what: &str) {
+    const BUF_BYTES: usize = 1 << 20;
+    let schedule: Option<SecSchedule> = cli
+        .syndrome_extraction_circuits
+        .then(|| cli.sec_schedule.into());
+
+    let written = if output_path == Path::new("-") {
+        let stdout = io::stdout();
+        let out = io::BufWriter::with_capacity(BUF_BYTES, stdout.lock());
+        stream_stim(checks, cli.distance, schedule, out)
+    } else {
+        let file = fs::File::create(output_path).unwrap_or_else(|e| {
+            eprintln!("error creating {}: {e}", output_path.display());
+            process::exit(1);
+        });
+        let out = io::BufWriter::with_capacity(BUF_BYTES, file);
+        stream_stim(checks, cli.distance, schedule, out)
+    };
+    let (ticks, mut stats) = written.unwrap_or_else(|e| {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            process::exit(0);
+        }
+        eprintln!("error writing {}: {e}", output_path.display());
+        process::exit(1);
+    });
+    if output_path != Path::new("-") {
+        eprintln!("Wrote {what} to {}", output_path.display());
+    }
+
+    if let Some(path) = &cli.stats {
+        stats.sec_depth = match schedule {
+            Some(_) => ticks,
+            None => stream_sec_tick_count(checks, cli.distance, cli.sec_schedule.into()),
+        };
+        write_stats(path, cli, stats);
+    }
 }
 
 /// Lower the compiled merged-qubit circuit and write it out as stim text, emitting
