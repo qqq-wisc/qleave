@@ -626,6 +626,15 @@ fn to_pauli_product_circuit(
 }
 
 fn resolve_corrections(circ: &PauliProductCircuit) -> PauliProductCircuit {
+    resolve_corrections_tagged(circ).0
+}
+
+/// [`resolve_corrections`], plus a flag per instruction of the *returned* circuit
+/// saying whether it is a correction that fired (rather than an instruction the
+/// circuit itself asked for). [`hybrid_cliffords`] needs the distinction: a
+/// correction is the only kind of Clifford whose presence is not known until the
+/// circuit runs, so it is the only kind that has to be materialized.
+fn resolve_corrections_tagged(circ: &PauliProductCircuit) -> (PauliProductCircuit, Vec<bool>) {
     use std::collections::HashMap;
 
     let mut outcomes: HashMap<crate::pbc::MeasId, bool> = HashMap::new();
@@ -642,6 +651,7 @@ fn resolve_corrections(circ: &PauliProductCircuit) -> PauliProductCircuit {
     }
 
     let mut result = PauliProductCircuit::new();
+    let mut from_correction = Vec::with_capacity(circ.instructions.len());
     result.next_meas_id = circ.next_meas_id;
     for instr in &circ.instructions {
         match instr {
@@ -655,12 +665,16 @@ fn resolve_corrections(circ: &PauliProductCircuit) -> PauliProductCircuit {
                         axis: axis.clone(),
                         angle: *angle,
                     });
+                    from_correction.push(true);
                 }
             }
-            other => result.instructions.push(other.clone()),
+            other => {
+                result.instructions.push(other.clone());
+                from_correction.push(false);
+            }
         }
     }
-    result
+    (result, from_correction)
 }
 
 fn to_load_store_circuit(
@@ -874,6 +888,74 @@ pub fn compile_steps(
     (load_store, pbc, clifford_free)
 }
 
+/// Number of measurement ids [`pi_over_4_gadget`] consumes out of the counter it
+/// is handed.
+const PI_OVER_4_GADGET_MEAS_IDS: u32 = 2;
+
+/// The |Y>-ancilla gadget performing `axis`(π/4) as two measurements, plus the
+/// re-preparation of the ancilla. Takes only the measurement-id counter it
+/// actually needs and hands the operations back as a value.
+///
+/// Every correction the gadget leaves behind is a π/2 rotation, i.e. a *Pauli*.
+/// Conjugating a Pauli axis by a Pauli can only flip its sign, never change its
+/// letters or its support, so measurement axes downstream of this gadget stay
+/// fixed at compile time. That is the whole point of materializing a Clifford
+/// instead of absorbing it into the frame.
+fn pi_over_4_gadget(
+    axis: &PauliAxis<ArchitectureQubit>,
+    ancilla: ArchitectureQubit,
+    next_meas_id: &mut u32,
+) -> [PauliProductOperation; 7] {
+    let mut joint_vec: Vec<(ArchitectureQubit, Pauli)> = axis.pauli_string.iter().cloned().collect();
+    joint_vec.push((ancilla, Pauli::Y));
+    let joint_axis = PauliAxis {
+        sign: axis.sign,
+        pauli_string: PauliString::new(joint_vec),
+    };
+    let id1 = MeasId(*next_meas_id);
+    let id2 = MeasId(*next_meas_id + 1);
+    *next_meas_id += PI_OVER_4_GADGET_MEAS_IDS;
+    let ancilla_axis = |pauli| PauliAxis {
+        sign: One,
+        pauli_string: PauliString::new(vec![(ancilla, pauli)]),
+    };
+    [
+        PauliProductOperation::Measurement {
+            axis: joint_axis,
+            id: id1,
+        },
+        PauliProductOperation::Measurement {
+            axis: ancilla_axis(Pauli::X),
+            id: id2,
+        },
+        PauliProductOperation::ConditionalRotation {
+            axis: PauliAxis {
+                sign: axis.sign,
+                pauli_string: axis.pauli_string.clone(),
+            },
+            angle: PiOver2,
+            condition: AllOf::and(AllOf::single(id1), id2),
+        },
+        PauliProductOperation::Rotation {
+            axis: ancilla_axis(Pauli::Z),
+            angle: PiOver4,
+        },
+        PauliProductOperation::Rotation {
+            axis: ancilla_axis(Pauli::X),
+            angle: PiOver4,
+        },
+        PauliProductOperation::Rotation {
+            axis: ancilla_axis(Pauli::Z),
+            angle: PiOver4,
+        },
+        PauliProductOperation::ConditionalRotation {
+            axis: ancilla_axis(Pauli::X),
+            angle: PiOver2,
+            condition: AllOf::single(id2),
+        },
+    ]
+}
+
 fn explicit_cliffords(
     circ: &PauliProductCircuit,
     ancilla: ArchitectureQubit,
@@ -884,74 +966,50 @@ fn explicit_cliffords(
         match instr {
             PauliProductOperation::Rotation { axis, angle } => {
                 if *angle == PiOver4 {
-                    let mut joint_vec: Vec<(ArchitectureQubit, Pauli)> =
-                        axis.pauli_string.iter().cloned().collect();
-                    joint_vec.push((ancilla, Pauli::Y));
-                    let joint_pauli = PauliString::new(joint_vec);
-                    let joint_axis = PauliAxis {
-                        sign: axis.sign,
-                        pauli_string: joint_pauli,
-                    };
-                    let id1 = result.allocate_meas_id();
-                    result
-                        .instructions
-                        .push(PauliProductOperation::Measurement {
-                            axis: joint_axis,
-                            id: id1,
-                        });
-                    let id2 = result.allocate_meas_id();
-                    result
-                        .instructions
-                        .push(PauliProductOperation::Measurement {
-                            axis: PauliAxis {
-                                sign: One,
-                                pauli_string: PauliString::new(vec![(ancilla, Pauli::X)]),
-                            },
-                            id: id2,
-                        });
-                    result
-                        .instructions
-                        .push(PauliProductOperation::ConditionalRotation {
-                            axis: PauliAxis {
-                                sign: axis.sign,
-                                pauli_string: axis.pauli_string.clone(),
-                            },
-                            angle: PiOver2,
-                            condition: AllOf::and(AllOf::single(id1), id2),
-                        });
-                    result.instructions.extend(vec![
-                        PauliProductOperation::Rotation {
-                            axis: PauliAxis {
-                                sign: One,
-                                pauli_string: PauliString::new(vec![(ancilla, Pauli::Z)]),
-                            },
-                            angle: PiOver4,
-                        },
-                        PauliProductOperation::Rotation {
-                            axis: PauliAxis {
-                                sign: One,
-                                pauli_string: PauliString::new(vec![(ancilla, Pauli::X)]),
-                            },
-                            angle: PiOver4,
-                        },
-                        PauliProductOperation::Rotation {
-                            axis: PauliAxis {
-                                sign: One,
-                                pauli_string: PauliString::new(vec![(ancilla, Pauli::Z)]),
-                            },
-                            angle: PiOver4,
-                        },
-                    ]);
-                    result.instructions.push(PauliProductOperation::ConditionalRotation {
-                        axis: PauliAxis {
-                            sign: One,
-                            pauli_string: PauliString::new(vec![(ancilla, Pauli::X)]),
-                        },
-                        angle: PiOver2,
-                        condition: AllOf::single(id2),
-                    });
+                    result.instructions.extend(pi_over_4_gadget(
+                        axis,
+                        ancilla,
+                        &mut result.next_meas_id,
+                    ));
                 }
             }
+            _ => result.instructions.push(instr.clone()),
+        }
+    }
+    result
+}
+
+/// The middle ground between absorbing every Clifford into the measurement frame
+/// (cheap, but a fired correction rewrites the Pauli axis of everything after it)
+/// and [`explicit_cliffords`] (fully static, but pays a gadget for every Clifford
+/// in the circuit).
+///
+/// Here only the Cliffords that came from a *correction* are materialized; the
+/// circuit's own deterministic Cliffords are still absorbed downstream by
+/// [`absorb_cliffords`]. Since the frame then only ever sees deterministic
+/// rotations, every emitted measurement's Pauli string is fixed at compile time.
+/// `from_correction` flags which instructions came out of a fired conditional --
+/// see [`resolve_corrections_tagged`].
+fn hybrid_cliffords(
+    circ: &PauliProductCircuit,
+    from_correction: &[bool],
+    ancilla: ArchitectureQubit,
+) -> PauliProductCircuit {
+    let mut result = PauliProductCircuit::new();
+    result.next_meas_id = circ.next_meas_id;
+    for (i, instr) in circ.instructions.iter().enumerate() {
+        match instr {
+            PauliProductOperation::Rotation { axis, angle }
+                if *angle == PiOver4 && from_correction[i] =>
+            {
+                result.instructions.extend(pi_over_4_gadget(
+                    axis,
+                    ancilla,
+                    &mut result.next_meas_id,
+                ));
+            }
+            // A π/2 correction is a Pauli; leaving it to the frame costs a sign
+            // flip and nothing else, so there is no reason to gadgetize it.
             _ => result.instructions.push(instr.clone()),
         }
     }
@@ -1009,6 +1067,77 @@ pub fn compile_explicit_clifford_steps(
         measurement_only
     };
     (load_store, pbc, explicit, resolved)
+}
+
+/// Shared body of the hybrid pathway: materialize only the corrections, absorb
+/// everything else. Returns (pbc_pre_clifford, pbc_hybrid_clifford, pbc_final).
+///
+/// The pass order matters. Corrections are resolved *first* so we know which
+/// ones fired and have to be gadgetized; the second resolve then handles the
+/// gadgets' own corrections, which are all π/2 (Pauli), so absorbing them into
+/// the frame only moves signs around. The frame therefore never sees a
+/// correction-dependent π/4 and every measurement's Pauli string is static.
+///
+/// Without `--simulate-corrections` there are no conditional rotations in the
+/// circuit at all (they are filtered out in [`to_pauli_product_circuit`]), so
+/// this degenerates to the ordinary absorbed compile.
+fn hybrid_pipeline(
+    load_store: &LoadStoreCircuit,
+    ancilla: ArchitectureQubit,
+    simulate_corrections: bool,
+) -> (
+    PauliProductCircuit,
+    PauliProductCircuit,
+    PauliProductCircuit,
+) {
+    let pbc = to_pauli_product_circuit(load_store, simulate_corrections);
+    if !simulate_corrections {
+        let final_circ = absorb_cliffords(&pbc);
+        return (pbc.clone(), pbc, final_circ);
+    }
+    let (resolved, from_correction) = resolve_corrections_tagged(&pbc);
+    let hybrid = hybrid_cliffords(&resolved, &from_correction, ancilla);
+    let final_circ = absorb_cliffords(&resolve_corrections(&hybrid));
+    (pbc, hybrid, final_circ)
+}
+
+/// Like [`compile`], but materializes only the Cliffords that came from a
+/// correction, leaving the circuit's own Cliffords to the measurement frame.
+/// See [`hybrid_cliffords`] for why that is the interesting middle ground.
+pub fn compile_hybrid(
+    circ: Circuit,
+    max_subcircuit_size: usize,
+    simulate_corrections: bool,
+    skip_redundant: bool,
+    sat_mode: bool,
+    sat_timeout: Option<u64>,
+) -> PauliProductCircuit {
+    let subcircuits = partition(circ, max_subcircuit_size - 1, sat_mode, sat_timeout);
+    let load_store = to_load_store_circuit(&subcircuits, max_subcircuit_size - 1, skip_redundant);
+    let ancilla = ArchitectureQubit::Processor(max_subcircuit_size - 1);
+    hybrid_pipeline(&load_store, ancilla, simulate_corrections).2
+}
+
+/// Like [`compile_steps`] but for the hybrid pathway. Returns
+/// (load_store, pbc_pre_clifford, pbc_hybrid_clifford, pbc_final).
+pub fn compile_hybrid_steps(
+    circ: Circuit,
+    max_subcircuit_size: usize,
+    simulate_corrections: bool,
+    skip_redundant: bool,
+    sat_mode: bool,
+    sat_timeout: Option<u64>,
+) -> (
+    LoadStoreCircuit,
+    PauliProductCircuit,
+    PauliProductCircuit,
+    PauliProductCircuit,
+) {
+    let subcircuits = partition(circ, max_subcircuit_size - 1, sat_mode, sat_timeout);
+    let load_store = to_load_store_circuit(&subcircuits, max_subcircuit_size - 1, skip_redundant);
+    let ancilla = ArchitectureQubit::Processor(max_subcircuit_size - 1);
+    let (pbc, hybrid, final_circ) = hybrid_pipeline(&load_store, ancilla, simulate_corrections);
+    (load_store, pbc, hybrid, final_circ)
 }
 
 #[cfg(test)]

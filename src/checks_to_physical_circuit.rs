@@ -693,59 +693,119 @@ enum Run {
 /// keeping only the in-progress line's state. The first I/O error is latched and
 /// returned by [`StimWriter::finish`], which also reports the `TICK` count so
 /// `--stats` needs no second pass over the expansion.
+///
+/// The frequent gate kinds are rendered by hand into a staging buffer instead of
+/// going through `core::fmt` — the formatting machinery was ~20% of a whole
+/// compilation at gigabytes of output. Rare gates (`MPP`, the declarations'
+/// tail) still render via `Display`, keeping one source of truth for their
+/// spelling.
 pub(crate) struct StimWriter<W: Write> {
     out: W,
+    /// Staging buffer, flushed to `out` in [`Self::FLUSH_AT`]-sized chunks —
+    /// large enough that a `BufWriter` underneath forwards them straight to the
+    /// file instead of copying.
+    buf: Vec<u8>,
     run: Run,
     indent: usize,
     ticks: usize,
     result: std::io::Result<()>,
 }
 
+/// Decimal digits of `n`, appended without going through `core::fmt`.
+fn push_uint(buf: &mut Vec<u8>, mut n: usize) {
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(&tmp[i..]);
+}
+
+fn pauli_letter(p: Pauli) -> u8 {
+    match p {
+        Pauli::X => b'X',
+        Pauli::Y => b'Y',
+        Pauli::Z => b'Z',
+        Pauli::I => b'I',
+    }
+}
+
 impl<W: Write> StimWriter<W> {
+    const FLUSH_AT: usize = 1 << 20;
+
     pub(crate) fn new(out: W) -> StimWriter<W> {
-        StimWriter { out, run: Run::None, indent: 0, ticks: 0, result: Ok(()) }
+        StimWriter {
+            out,
+            buf: Vec::with_capacity(Self::FLUSH_AT + 256),
+            run: Run::None,
+            indent: 0,
+            ticks: 0,
+            result: Ok(()),
+        }
     }
 
     /// Flush the pending line, flush the underlying writer, and report the total
     /// `TICK` count (or the first I/O error hit along the way).
     pub(crate) fn finish(mut self) -> std::io::Result<usize> {
         self.end_run();
+        if self.result.is_ok() {
+            self.result = self.out.write_all(&self.buf);
+        }
         self.result?;
         self.out.flush()?;
         Ok(self.ticks)
     }
 
-    /// Run `f` unless a previous write already failed, latching its error.
-    fn write(&mut self, f: impl FnOnce(&mut W) -> std::io::Result<()>) {
-        if self.result.is_ok() {
-            self.result = f(&mut self.out);
+    /// Hand the staging buffer to `out` once it is full enough, latching the
+    /// first error (after which nothing further is written).
+    fn maybe_flush(&mut self) {
+        if self.buf.len() >= Self::FLUSH_AT {
+            if self.result.is_ok() {
+                self.result = self.out.write_all(&self.buf);
+            }
+            self.buf.clear();
         }
+    }
+
+    fn push_indent(&mut self) {
+        self.buf.resize(self.buf.len() + self.indent, b' ');
     }
 
     /// Terminate the coalesced line in progress, if any.
     fn end_run(&mut self) {
         if self.run != Run::None {
             self.run = Run::None;
-            self.write(|w| writeln!(w));
+            self.buf.push(b'\n');
+            self.maybe_flush();
         }
     }
 
     /// Start (or continue) a coalesced line of kind `run` whose head is `head`.
-    fn start_run(&mut self, run: Run, head: std::fmt::Arguments<'_>) {
+    fn start_run(&mut self, run: Run, head: &[u8]) {
         if self.run == run {
             return;
         }
         self.end_run();
         self.run = run;
-        let indent = self.indent;
-        self.write(|w| write!(w, "{:indent$}{head}", ""));
+        self.push_indent();
+        self.buf.extend_from_slice(head);
     }
 
-    /// Emit `gate` on a line of its own, ending any coalesced line first.
+    /// Emit `gate` on a line of its own via its `Display` impl (the slow path,
+    /// for the gate kinds rare enough not to matter), ending any coalesced line
+    /// first.
     fn standalone(&mut self, gate: &PhysicalGate<usize>) {
         self.end_run();
-        let indent = self.indent;
-        self.write(|w| writeln!(w, "{:indent$}{gate}", ""));
+        self.push_indent();
+        use std::io::Write as _;
+        let res = write!(self.buf, "{gate}\n");
+        debug_assert!(res.is_ok(), "writing to a Vec cannot fail");
+        self.maybe_flush();
     }
 }
 
@@ -753,30 +813,57 @@ impl<W: Write> GateSink for StimWriter<W> {
     fn push(&mut self, gate: PhysicalGate<usize>) {
         match gate {
             PhysicalGate::Reset(basis, q) => {
-                self.start_run(Run::Reset(basis), format_args!("R{basis}"));
-                self.write(|w| write!(w, " {q}"));
+                self.start_run(Run::Reset(basis), &[b'R', pauli_letter(basis)]);
+                self.buf.push(b' ');
+                push_uint(&mut self.buf, q);
             }
             PhysicalGate::Measure(basis, q, invert) => {
-                self.start_run(Run::Measure(basis), format_args!("M{basis}"));
-                let bang = if invert { "!" } else { "" };
-                self.write(|w| write!(w, " {bang}{q}"));
+                self.start_run(Run::Measure(basis), &[b'M', pauli_letter(basis)]);
+                self.buf.push(b' ');
+                if invert {
+                    self.buf.push(b'!');
+                }
+                push_uint(&mut self.buf, q);
             }
             PhysicalGate::Controlled(pauli, c, t) => {
-                self.start_run(Run::Controlled(pauli), format_args!("C{pauli}"));
-                self.write(|w| write!(w, " {c} {t}"));
+                self.start_run(Run::Controlled(pauli), &[b'C', pauli_letter(pauli)]);
+                self.buf.push(b' ');
+                push_uint(&mut self.buf, c);
+                self.buf.push(b' ');
+                push_uint(&mut self.buf, t);
             }
             PhysicalGate::XCorrection(rec, q) => {
-                self.start_run(Run::XCorrection, format_args!("CNOT"));
-                self.write(|w| write!(w, " rec[-{rec}] {q}"));
+                self.start_run(Run::XCorrection, b"CNOT");
+                self.buf.extend_from_slice(b" rec[-");
+                push_uint(&mut self.buf, rec);
+                self.buf.extend_from_slice(b"] ");
+                push_uint(&mut self.buf, q);
             }
             PhysicalGate::Tick => {
                 self.ticks += 1;
-                self.standalone(&PhysicalGate::Tick);
+                self.end_run();
+                self.push_indent();
+                self.buf.extend_from_slice(b"TICK\n");
+                self.maybe_flush();
+            }
+            PhysicalGate::DeclareDetector(recs) => {
+                self.end_run();
+                self.push_indent();
+                self.buf.extend_from_slice(b"DETECTOR");
+                for r in &recs {
+                    self.buf.extend_from_slice(b" rec[-");
+                    push_uint(&mut self.buf, *r);
+                    self.buf.push(b']');
+                }
+                self.buf.push(b'\n');
+                self.maybe_flush();
             }
             PhysicalGate::Repeat(n, body) => {
                 self.end_run();
-                let indent = self.indent;
-                self.write(|w| writeln!(w, "{:indent$}REPEAT {n} {{", ""));
+                self.push_indent();
+                self.buf.extend_from_slice(b"REPEAT ");
+                push_uint(&mut self.buf, n);
+                self.buf.extend_from_slice(b" {\n");
                 self.indent += 4;
                 let before = self.ticks;
                 for gate in body {
@@ -787,8 +874,9 @@ impl<W: Write> GateSink for StimWriter<W> {
                 // The body's ticks were counted once by the loop above; the
                 // remaining n−1 iterations are accounted for here.
                 self.ticks += n.saturating_sub(1) * (self.ticks - before);
-                let indent = self.indent;
-                self.write(|w| writeln!(w, "{:indent$}}}", ""));
+                self.push_indent();
+                self.buf.extend_from_slice(b"}\n");
+                self.maybe_flush();
             }
             gate => self.standalone(&gate),
         }
@@ -1005,8 +1093,41 @@ fn record_window(checks: &DeformedCheckSequence) -> usize {
 /// through an interner that persists across chunks, optionally SEC-expand it, and
 /// hand the result to `sink` — accumulating the `--stats` counters that can only be
 /// read off the merged, pre-expansion form on the way past.
+/// Multiply-xor hasher (the rustc / FxHash construction) for the qubit
+/// interner: it is probed once per Pauli site of every streamed gate, where
+/// SipHash alone was ~10% of a compilation. Not DoS-resistant, which is fine —
+/// the keys are the compiler's own qubit ids, not attacker input.
+#[derive(Default)]
+struct FxHasher(u64);
+
+impl std::hash::Hasher for FxHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+    fn write_u8(&mut self, n: u8) {
+        self.write_u64(n as u64);
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(n as u64);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517cc1b727220a95);
+    }
+}
+
 struct ChunkPipe<S: GateSink> {
-    ids: BTreeMap<MergedQubit, usize>,
+    /// Qubit interner. Ids are handed out in order of first appearance — a
+    /// property of the insertion logic, not of the map — so a hash map serves;
+    /// the tree version's per-site lookups were ~20% of the whole compilation.
+    ids: std::collections::HashMap<MergedQubit, usize, std::hash::BuildHasherDefault<FxHasher>>,
     /// Reused across chunks so the per-deformation flattening does not reallocate.
     flat: Vec<PhysicalGate<usize>>,
     /// The LRC expansion's old→new record map, carried across chunks so a later
@@ -1014,6 +1135,14 @@ struct ChunkPipe<S: GateSink> {
     /// every record is what made `--stats` and `--syndrome-extraction-circuits`
     /// memory-bound long after the gates themselves stopped being.
     lrc_map: crate::sec_schedule::RecordMap,
+    /// Per-(deformation, segment) schedule memo — the reason a repeated
+    /// deformation no longer pays for conflict classes, partitions, and edge
+    /// colorings on every occurrence.
+    lrc_plans: crate::sec_schedule::SegPlanCache,
+    /// Identity of the deformation the next `visit` lowers, recorded in
+    /// `wants` and consumed by `push_chunk`; `None` for the leading reset
+    /// chunk (which has no syndrome rounds to cache anyway).
+    chunk_id: Option<usize>,
     schedule: Option<SecSchedule>,
     ancilla_base: usize,
     syndrome_cycles: usize,
@@ -1029,9 +1158,11 @@ impl<S: GateSink> ChunkPipe<S> {
         sink: S,
     ) -> ChunkPipe<S> {
         ChunkPipe {
-            ids: BTreeMap::new(),
+            ids: Default::default(),
             flat: Vec::new(),
             lrc_map: crate::sec_schedule::RecordMap::windowed(record_window),
+            lrc_plans: Default::default(),
+            chunk_id: None,
             schedule,
             ancilla_base,
             syndrome_cycles: 0,
@@ -1041,6 +1172,9 @@ impl<S: GateSink> ChunkPipe<S> {
     }
 
     fn push_chunk(&mut self, gates: &[PhysicalGate<MergedQubit>]) {
+        // `take()` so a visit that was not announced by `wants` (the reset
+        // chunk) can never reuse a stale identity.
+        let chunk_id = self.chunk_id.take();
         // The whole chunking scheme rests on this: a syndrome round is a maximal run
         // of consecutive `MPP`s, so a chunk that ended mid-run would be expanded — and
         // counted — as two rounds where the materialized circuit has one. Deformations
@@ -1076,6 +1210,8 @@ impl<S: GateSink> ChunkPipe<S> {
                 self.ancilla_base,
                 &mut self.sink,
                 &mut self.lrc_map,
+                &mut self.lrc_plans,
+                chunk_id,
             ),
             Some(SecSchedule::Legacy) => {
                 expand_gates_into(&self.flat, self.ancilla_base, &mut self.sink)
@@ -1093,8 +1229,15 @@ impl<S: GateSink> ChunkPipe<S> {
 }
 
 /// Writing consumers take every chunk: the same deformation still has to be emitted
-/// once per occurrence, however often it repeats.
+/// once per occurrence, however often it repeats — but `wants` records which
+/// deformation is coming, so the SEC expansion can replay its cached schedule
+/// instead of recomputing it.
 impl<S: GateSink> ChunkVisitor for ChunkPipe<S> {
+    fn wants(&mut self, deformation: &Rc<Deformation>) -> bool {
+        self.chunk_id = Some(Rc::as_ptr(deformation) as usize);
+        true
+    }
+
     fn visit(&mut self, gates: &[PhysicalGate<MergedQubit>]) {
         self.push_chunk(gates);
     }

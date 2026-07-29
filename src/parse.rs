@@ -12,17 +12,15 @@ pub fn parse(qasm: &str) -> Result<Circuit, String> {
     let mut c = Circuit::new(0);
     for (line_num, raw_line) in qasm.lines().enumerate() {
         let line_num = line_num + 1;
+        // Strip the line comment before splitting on ';', otherwise a semicolon
+        // inside a comment splits it into bogus statements.
+        let raw_line = strip_line_comment(raw_line);
         for line in raw_line
             .split(';')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
-            let line = match line.find("//") {
-                Some(pos) => line[..pos].trim(),
-                None => line,
-            };
             if line.is_empty()
-                || line.starts_with("//")
                 || line.starts_with("OPENQASM")
                 || line.starts_with("include")
                 || line.starts_with("barrier")
@@ -176,7 +174,7 @@ impl<R: BufRead> StreamingReader<R> {
             line_num += 1;
 
             let line = Self::strip_block_comment_line(&line_buf, &mut in_block_comment);
-            let line = line.trim().to_string();
+            let line = strip_line_comment(&line).trim().to_string();
             if line.is_empty() {
                 continue;
             }
@@ -185,12 +183,7 @@ impl<R: BufRead> StreamingReader<R> {
             let mut hit_gate = false;
 
             for stmt in line.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                let stmt = match stmt.find("//") {
-                    Some(pos) => stmt[..pos].trim(),
-                    None => stmt,
-                };
                 if stmt.is_empty()
-                    || stmt.starts_with("//")
                     || stmt.starts_with("OPENQASM")
                     || stmt.starts_with("include")
                     || stmt.starts_with("barrier")
@@ -256,18 +249,13 @@ impl<R: BufRead> StreamingReader<R> {
             let line_num = self.line_num;
 
             let line = Self::strip_block_comment_line(&line_buf, &mut self.in_block_comment);
-            let line = line.trim().to_string();
+            let line = strip_line_comment(&line).trim().to_string();
             if line.is_empty() {
                 continue;
             }
 
             for stmt in line.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                let stmt = match stmt.find("//") {
-                    Some(pos) => stmt[..pos].trim(),
-                    None => stmt,
-                };
                 if stmt.is_empty()
-                    || stmt.starts_with("//")
                     || stmt.starts_with("OPENQASM")
                     || stmt.starts_with("include")
                     || stmt.starts_with("barrier")
@@ -309,6 +297,14 @@ impl<R: BufRead> StreamingReader<R> {
             }
         }
         out
+    }
+}
+
+/// Truncate a line at its `//` comment marker.
+fn strip_line_comment(line: &str) -> &str {
+    match line.find("//") {
+        Some(pos) => &line[..pos],
+        None => line,
     }
 }
 
@@ -457,6 +453,38 @@ mod tests {
             "OPENQASM 2.0;\ninclude \"qelib1.inc\";\n// just a comment\nqreg q[1];\nh q[0];\n";
         let c = parse(qasm).unwrap();
         assert_eq!(c.gates.len(), 1);
+    }
+
+    #[test]
+    fn semicolon_inside_line_comment() {
+        let qasm = "OPENQASM 2.0;\nqreg q[1];\n// ancillas; they start in |0>.\nh q[0];\n";
+        let c = parse(qasm).unwrap();
+        assert_eq!(c.gates.len(), 1);
+        assert!(matches!(&c.gates[0], Gate::H(Qubit(0))));
+    }
+
+    #[test]
+    fn semicolon_inside_trailing_line_comment() {
+        let qasm = "OPENQASM 2.0;\nqreg q[1];\nh q[0]; // note; also a semicolon\nt q[0];\n";
+        let c = parse(qasm).unwrap();
+        assert_eq!(c.gates.len(), 2);
+        assert!(matches!(&c.gates[0], Gate::H(Qubit(0))));
+        assert!(matches!(&c.gates[1], Gate::T(Qubit(0))));
+    }
+
+    #[test]
+    fn streaming_semicolon_inside_line_comment() {
+        let qasm = "OPENQASM 2.0;\n// ancillas; they start in |0>.\nqreg q[1];\n\
+                    // more; commentary\nh q[0];\nt q[0]; // done; really\n";
+        let mut r = StreamingReader::new(std::io::Cursor::new(qasm)).unwrap();
+        assert_eq!(r.num_qubits, 1);
+        let mut gates = Vec::new();
+        while let Some(batch) = r.next_batch(64).unwrap() {
+            gates.extend(batch);
+        }
+        assert_eq!(gates.len(), 2);
+        assert!(matches!(&gates[0], Gate::H(Qubit(0))));
+        assert!(matches!(&gates[1], Gate::T(Qubit(0))));
     }
 
     #[test]

@@ -54,7 +54,7 @@
 //! outside `REPEAT` bodies. Round detectors inside bodies are re-emitted
 //! structurally with iteration-invariant offsets (see [`StaggeredSeg::emit`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::checks_to_physical_circuit::{GateSink, PhysicalGate};
 use crate::pbc::{Pauli, PauliAxis, Sign};
@@ -258,11 +258,13 @@ fn partition_left(checks: &[&PauliAxis<usize>], classes: &[usize]) -> std::colle
     qubit_side.iter().filter(|&(_, &s)| s == 0).map(|(&q, _)| q).collect()
 }
 
-/// A staggered left–right segment: one check set measured for `r` consecutive
-/// rounds (a reference round plus a `REPEAT` of identical rounds).
-struct StaggeredSeg<'a> {
-    checks: &'a [&'a PauliAxis<usize>],
-    base: usize,
+/// The expensive, reusable part of a staggered left–right segment: conflict
+/// classes, the left/right partition, and the four phase-subgraph edge
+/// colorings. Everything here depends only on the check set — the buckets hold
+/// `Site`s (check index, data qubit, site Pauli), with `base` applied at
+/// emission — so one plan replays for every occurrence of the same round (see
+/// [`SegPlanCache`]).
+struct StaggeredPlan {
     m: usize,
     /// Class sizes: `a = |G1|`, `b = |G2|`.
     a: usize,
@@ -280,8 +282,18 @@ struct StaggeredSeg<'a> {
     r1: Vec<Vec<Site>>,
 }
 
-impl<'a> StaggeredSeg<'a> {
-    fn new(checks: &'a [&'a PauliAxis<usize>], classes: Vec<usize>, base: usize) -> Self {
+/// A staggered left–right segment: a [`StaggeredPlan`] bound to the concrete
+/// check set and ancilla base it is emitted against — one check set measured
+/// for `r` consecutive rounds (a reference round plus a `REPEAT` of identical
+/// rounds).
+struct StaggeredSeg<'a> {
+    plan: &'a StaggeredPlan,
+    checks: &'a [&'a PauliAxis<usize>],
+    base: usize,
+}
+
+impl StaggeredPlan {
+    fn new(checks: &[&PauliAxis<usize>], classes: Vec<usize>) -> Self {
         let m = checks.len();
         let left = partition_left(checks, &classes);
         let mut subpos = vec![0usize; m];
@@ -328,9 +340,7 @@ impl<'a> StaggeredSeg<'a> {
             color_part(&parts[2]),
             color_part(&parts[3]),
         ];
-        StaggeredSeg {
-            checks,
-            base,
+        StaggeredPlan {
             m,
             a: g1.len(),
             b: g2.len(),
@@ -344,7 +354,9 @@ impl<'a> StaggeredSeg<'a> {
             r1,
         }
     }
+}
 
+impl<'a> StaggeredSeg<'a> {
     fn cnots<'b>(&self, bucket: &'b [Site]) -> impl Iterator<Item = Gate> + 'b {
         let base = self.base;
         bucket.iter().map(move |&(j, q, p)| PhysicalGate::Controlled(p, base + j, q))
@@ -372,43 +384,44 @@ impl<'a> StaggeredSeg<'a> {
     /// folds are qubit-disjoint (G2 ancillas vs right data + G1 ancillas), and
     /// G2(n)'s left CNOTs start only after its reset.
     fn round_layers(&self, prologue: bool) -> Vec<Vec<Gate>> {
+        let plan = self.plan;
         let mut layers: Vec<Vec<Gate>> = Vec::new();
-        layers.push(self.g1.iter().map(|&j| PhysicalGate::Reset(Pauli::X, self.base + j)).collect());
-        let t1 = if prologue { self.l1.len() } else { self.l1.len().max(self.r2.len()) };
+        layers.push(plan.g1.iter().map(|&j| PhysicalGate::Reset(Pauli::X, self.base + j)).collect());
+        let t1 = if prologue { plan.l1.len() } else { plan.l1.len().max(plan.r2.len()) };
         for k in 0..t1 {
             let mut layer = Vec::new();
-            if let Some(bucket) = self.l1.get(k) {
+            if let Some(bucket) = plan.l1.get(k) {
                 layer.extend(self.cnots(bucket));
             }
             if !prologue {
-                if let Some(bucket) = self.r2.get(k) {
+                if let Some(bucket) = plan.r2.get(k) {
                     layer.extend(self.cnots(bucket));
                 }
             }
             layers.push(layer);
         }
-        let t2 = (self.l2.len() + 2).max(self.r1.len()).max(2);
+        let t2 = (plan.l2.len() + 2).max(plan.r1.len()).max(2);
         for k in 0..t2 {
             let mut layer = Vec::new();
-            if let Some(bucket) = self.r1.get(k) {
+            if let Some(bucket) = plan.r1.get(k) {
                 layer.extend(self.cnots(bucket));
             }
             if k == 0 && !prologue {
-                layer.extend(self.measure(&self.g2));
+                layer.extend(self.measure(&plan.g2));
             }
             if k == 1 {
                 layer.extend(
-                    self.g2.iter().map(|&j| PhysicalGate::Reset(Pauli::X, self.base + j)),
+                    plan.g2.iter().map(|&j| PhysicalGate::Reset(Pauli::X, self.base + j)),
                 );
             }
             if k >= 2 {
-                if let Some(bucket) = self.l2.get(k - 2) {
+                if let Some(bucket) = plan.l2.get(k - 2) {
                     layer.extend(self.cnots(bucket));
                 }
             }
             layers.push(layer);
         }
-        layers.push(self.measure(&self.g1));
+        layers.push(self.measure(&plan.g1));
         layers
     }
 
@@ -417,8 +430,8 @@ impl<'a> StaggeredSeg<'a> {
     /// measurement.
     fn epilogue_layers(&self) -> Vec<Vec<Gate>> {
         let mut layers: Vec<Vec<Gate>> =
-            self.r2.iter().map(|bucket| self.cnots(bucket).collect()).collect();
-        layers.push(self.measure(&self.g2));
+            self.plan.r2.iter().map(|bucket| self.cnots(bucket).collect()).collect();
+        layers.push(self.measure(&self.plan.g2));
         layers
     }
 
@@ -441,7 +454,7 @@ impl<'a> StaggeredSeg<'a> {
     /// comparison with `rec[-(b−q)]` / `rec[-(m+b−q)]`. Each check gets r−1
     /// detectors, as in the MPP stream.
     fn emit<S: GateSink>(&self, r: usize, out: &mut S, map: &mut RecordMap) {
-        let (m, a, b) = (self.m, self.a, self.b);
+        let (m, a, b) = (self.plan.m, self.plan.a, self.plan.b);
         let g1_detectors = || -> Vec<Gate> {
             (0..a).map(|p| PhysicalGate::DeclareDetector(vec![a - p, m + a - p])).collect()
         };
@@ -466,8 +479,8 @@ impl<'a> StaggeredSeg<'a> {
         let start = map.len();
         for n in 1..=r {
             for j in 0..m {
-                let p = self.subpos[j];
-                map.push(if self.class_of[j] == 0 {
+                let p = self.plan.subpos[j];
+                map.push(if self.plan.class_of[j] == 0 {
                     if n == 1 { start + p } else { start + a + (n - 2) * m + b + p }
                 } else {
                     start + a + (n - 1) * m + p
@@ -488,39 +501,59 @@ fn push_layers<S: GateSink>(out: &mut S, layers: Vec<Vec<Gate>>) {
     }
 }
 
-/// Emit one syndrome round under the sequential conflict-phase schedule: a
-/// reset layer, each conflict class's edge-colored CNOT layers in class order
-/// (consistent ordering for every conflicting pair), and a measure layer in
-/// check order — so the record stream matches the MPP stream exactly.
-fn emit_round_sequential<S: GateSink>(checks: &[&PauliAxis<usize>], base: usize, out: &mut S) {
-    let m = checks.len();
-    let classes = conflict_classes(checks);
-    let n_classes = classes.iter().copied().max().map_or(0, |c| c + 1);
+/// The reusable part of the sequential conflict-phase schedule: each conflict
+/// class's edge-colored CNOT layers, in class order (consistent ordering for
+/// every conflicting pair). Like [`StaggeredPlan`], depends only on the check
+/// set.
+struct SequentialPlan {
+    cnot_layers: Vec<Vec<Site>>,
+}
 
+impl SequentialPlan {
+    fn new(checks: &[&PauliAxis<usize>], classes: &[usize], n_classes: usize) -> Self {
+        let m = checks.len();
+        let mut cnot_layers = Vec::new();
+        for c in 0..n_classes {
+            let part: Vec<Site> = checks
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| classes[j] == c)
+                .flat_map(|(j, check)| sites(check).map(move |(q, p)| (j, q, p)))
+                .collect();
+            let mut qid: BTreeMap<usize, usize> = BTreeMap::new();
+            for &(_, q, _) in &part {
+                let next = m + qid.len();
+                qid.entry(q).or_insert(next);
+            }
+            let edges: Vec<(usize, usize)> = part.iter().map(|&(j, q, _)| (j, qid[&q])).collect();
+            let colors = bipartite_edge_coloring(m + qid.len(), &edges);
+            let n_colors = colors.iter().copied().max().map_or(0, |k| k + 1);
+            let mut buckets = vec![Vec::new(); n_colors];
+            for (i, &site) in part.iter().enumerate() {
+                buckets[colors[i]].push(site);
+            }
+            cnot_layers.extend(buckets);
+        }
+        SequentialPlan { cnot_layers }
+    }
+}
+
+/// Emit one syndrome round under the sequential conflict-phase schedule: a
+/// reset layer, the plan's CNOT layers, and a measure layer in check order —
+/// so the record stream matches the MPP stream exactly.
+fn emit_round_planned<S: GateSink>(
+    plan: &SequentialPlan,
+    checks: &[&PauliAxis<usize>],
+    base: usize,
+    out: &mut S,
+) {
+    let m = checks.len();
     let mut layers: Vec<Vec<Gate>> = vec![(0..m)
         .map(|j| PhysicalGate::Reset(Pauli::X, base + j))
         .collect()];
-    for c in 0..n_classes {
-        let part: Vec<Site> = checks
-            .iter()
-            .enumerate()
-            .filter(|&(j, _)| classes[j] == c)
-            .flat_map(|(j, check)| sites(check).map(move |(q, p)| (j, q, p)))
-            .collect();
-        let mut qid: BTreeMap<usize, usize> = BTreeMap::new();
-        for &(_, q, _) in &part {
-            let next = m + qid.len();
-            qid.entry(q).or_insert(next);
-        }
-        let edges: Vec<(usize, usize)> = part.iter().map(|&(j, q, _)| (j, qid[&q])).collect();
-        let colors = bipartite_edge_coloring(m + qid.len(), &edges);
-        let n_colors = colors.iter().copied().max().map_or(0, |k| k + 1);
-        let mut buckets = vec![Vec::new(); n_colors];
-        for (i, &(j, q, p)) in part.iter().enumerate() {
-            buckets[colors[i]].push(PhysicalGate::Controlled(p, base + j, q));
-        }
-        layers.extend(buckets);
-    }
+    layers.extend(plan.cnot_layers.iter().map(|bucket| {
+        bucket.iter().map(|&(j, q, p)| PhysicalGate::Controlled(p, base + j, q)).collect()
+    }));
     layers.push(
         checks
             .iter()
@@ -535,6 +568,14 @@ fn emit_round_sequential<S: GateSink>(checks: &[&PauliAxis<usize>], base: usize,
             .collect(),
     );
     push_layers(out, layers);
+}
+
+/// [`emit_round_planned`] with the plan built on the spot (the no-cache path).
+fn emit_round_sequential<S: GateSink>(checks: &[&PauliAxis<usize>], base: usize, out: &mut S) {
+    let classes = conflict_classes(checks);
+    let n_classes = classes.iter().copied().max().map_or(0, |c| c + 1);
+    let plan = SequentialPlan::new(checks, &classes, n_classes);
+    emit_round_planned(&plan, checks, base, out);
 }
 
 /// Whether a `REPEAT` body is the canonical `d_rounds` shape for `checks`: the
@@ -695,6 +736,62 @@ fn expand_sequential_only(gates: &[Gate], base: usize) -> Vec<Gate> {
     out
 }
 
+/// A segment's scheduling artifacts: which schedule was chosen and its
+/// precomputed layer structure.
+enum SegPlan {
+    Staggered(StaggeredPlan),
+    Sequential(SequentialPlan),
+}
+
+/// Build the plan for one segment of `r` rounds over `checks` — the expensive
+/// part of the expansion (conflict classes, partition, edge colorings), pulled
+/// out so [`SegPlanCache`] can pay for it once per distinct segment.
+fn build_seg_plan(checks: &[&PauliAxis<usize>], r: usize) -> SegPlan {
+    let classes = conflict_classes(checks);
+    let n_classes = classes.iter().copied().max().map_or(0, |c| c + 1);
+    if std::env::var("SEC_DEBUG").is_ok() {
+        let mixed = checks
+            .iter()
+            .filter(|c| {
+                let mut ps = sites(c).map(|(_, p)| p);
+                let first = ps.next();
+                ps.any(|p| Some(p) != first)
+            })
+            .count();
+        eprintln!(
+            "[sec] segment: m={} r={r} chi={n_classes} mixed_checks={mixed} -> {}",
+            checks.len(),
+            if n_classes == 2 && r >= 2 { "staggered" } else { "sequential" }
+        );
+    }
+    if n_classes == 2 && r >= 2 {
+        SegPlan::Staggered(StaggeredPlan::new(checks, classes))
+    } else {
+        SegPlan::Sequential(SequentialPlan::new(checks, &classes, n_classes))
+    }
+}
+
+/// Memo of [`SegPlan`]s across chunks of the streaming lowering, keyed by
+/// (chunk identity, segment index within the chunk).
+///
+/// The streaming path re-lowers a deformation once per *occurrence*, but a
+/// repeated deformation expands to identical gates (the qubit interner is
+/// persistent, so ids are stable after first appearance), hence identical
+/// segments in identical order — and a plan depends on nothing but the
+/// segment's checks. On `mod_adder_1024` the support cache repeats ~200
+/// distinct deformations across 26k+ occurrences, and rebuilding the plans
+/// (conflict classes, partitions, edge colorings) each time dominated the
+/// whole compilation.
+///
+/// The chunk identity is the deformation's `Rc` pointer. That is sound because
+/// the `DeformedCheckSequence` keeps every `Rc<Deformation>` alive for the
+/// whole stream — the same invariant `record_window` and `MemoizedTicks`
+/// already rely on for their pointer-keyed memos.
+#[derive(Default)]
+pub(crate) struct SegPlanCache {
+    plans: HashMap<(usize, usize), SegPlan>,
+}
+
 /// Lower every MPP syndrome round of `gates` to the left–right /
 /// conflict-phase schedules, rewriting downstream `rec[-k]` offsets through
 /// the resulting record permutation. `base` is the first ancilla id (one past
@@ -706,7 +803,7 @@ fn expand_sequential_only(gates: &[Gate], base: usize) -> Vec<Gate> {
 /// disk instead of holding it (see [`crate::checks_to_physical_circuit::StimWriter`]).
 pub(crate) fn expand_gates_lrc_into<S: GateSink>(gates: &[Gate], base: usize, out: &mut S) {
     let mut map = RecordMap::full();
-    expand_gates_lrc_with_map(gates, base, out, &mut map);
+    expand_gates_lrc_with_map(gates, base, out, &mut map, &mut SegPlanCache::default(), None);
 }
 
 /// [`expand_gates_lrc_into`] over a caller-owned record map, so a circuit can be
@@ -715,11 +812,17 @@ pub(crate) fn expand_gates_lrc_into<S: GateSink>(gates: &[Gate], base: usize, ou
 /// `rec[-k]` still resolve against records emitted by an earlier one. Splitting is
 /// only sound where no `MPP` run straddles the boundary — the streaming lowerer
 /// cuts between deformations, each of which ends in the split's `M`/`CNOT` gates.
+///
+/// `cache`/`chunk` memoize per-segment plans across calls: `chunk` identifies
+/// which deformation this call lowers (see [`SegPlanCache`]); `None` disables
+/// the memo and rebuilds every plan.
 pub(crate) fn expand_gates_lrc_with_map<S: GateSink>(
     gates: &[Gate],
     base: usize,
     out: &mut S,
     map: &mut RecordMap,
+    cache: &mut SegPlanCache,
+    chunk: Option<usize>,
 ) {
     // `map.len()` doubles as the running old-record count, which equals the running
     // new-record count everywhere outside a segment (both schedules preserve
@@ -729,6 +832,7 @@ pub(crate) fn expand_gates_lrc_with_map<S: GateSink>(
     };
 
     let mut i = 0;
+    let mut seg_idx = 0usize;
     while i < gates.len() {
         match &gates[i] {
             PhysicalGate::MPP(_) => {
@@ -746,38 +850,38 @@ pub(crate) fn expand_gates_lrc_with_map<S: GateSink>(
                     _ => None,
                 };
                 let r = 1 + matched_repeat.unwrap_or(0);
-                let classes = conflict_classes(&checks);
-                let n_classes = classes.iter().copied().max().map_or(0, |c| c + 1);
-                if std::env::var("SEC_DEBUG").is_ok() {
-                    let mixed = checks
-                        .iter()
-                        .filter(|c| {
-                            let mut ps = sites(c).map(|(_, p)| p);
-                            let first = ps.next();
-                            ps.any(|p| Some(p) != first)
-                        })
-                        .count();
-                    eprintln!(
-                        "[sec] segment: m={m} r={r} chi={n_classes} mixed_checks={mixed} -> {}",
-                        if n_classes == 2 && r >= 2 { "staggered" } else { "sequential" }
-                    );
-                }
-                if n_classes == 2 && r >= 2 {
-                    StaggeredSeg::new(&checks, classes, base).emit(r, out, map);
-                } else {
-                    // Sequential: reference round, then (if matched) a body of
-                    // the same round with the original detectors — offsets are
-                    // preserved because record order is.
-                    emit_round_sequential(&checks, base, out);
-                    if let Some(n) = matched_repeat {
-                        let mut body = Vec::new();
-                        emit_round_sequential(&checks, base, &mut body);
-                        body.extend(
-                            (0..m).map(|k| PhysicalGate::DeclareDetector(vec![k + 1, m + k + 1])),
-                        );
-                        out.push(PhysicalGate::Repeat(n, body));
+                let fresh;
+                let plan = match chunk {
+                    Some(id) => cache
+                        .plans
+                        .entry((id, seg_idx))
+                        .or_insert_with(|| build_seg_plan(&checks, r)),
+                    None => {
+                        fresh = build_seg_plan(&checks, r);
+                        &fresh
                     }
-                    extend_identity(map, r * m);
+                };
+                seg_idx += 1;
+                match plan {
+                    SegPlan::Staggered(p) => {
+                        StaggeredSeg { plan: p, checks: &checks, base }.emit(r, out, map);
+                    }
+                    SegPlan::Sequential(p) => {
+                        // Sequential: reference round, then (if matched) a body of
+                        // the same round with the original detectors — offsets are
+                        // preserved because record order is.
+                        emit_round_planned(p, &checks, base, out);
+                        if let Some(n) = matched_repeat {
+                            let mut body = Vec::new();
+                            emit_round_planned(p, &checks, base, &mut body);
+                            body.extend(
+                                (0..m)
+                                    .map(|k| PhysicalGate::DeclareDetector(vec![k + 1, m + k + 1])),
+                            );
+                            out.push(PhysicalGate::Repeat(n, body));
+                        }
+                        extend_identity(map, r * m);
+                    }
                 }
                 i = j + matched_repeat.map_or(0, |_| 1);
             }

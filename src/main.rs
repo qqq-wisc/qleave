@@ -13,7 +13,10 @@ use qleave::{
         CodeData, DeformedCheckSequence, pauli_product_circuit_to_physical_supports,
         physical_supports_to_stabilizer_checks,
     },
-    compile::{compile, compile_explicit_clifford, compile_explicit_clifford_steps, compile_steps},
+    compile::{
+        compile, compile_explicit_clifford, compile_explicit_clifford_steps, compile_hybrid,
+        compile_hybrid_steps, compile_steps,
+    },
     graph_construction::SurgeryGraphConfig,
     parse::parse,
     pbc::Pauli,
@@ -162,6 +165,18 @@ struct Cli {
     /// --intermediates, also writes pbc_explicit_clifford.txt.
     #[arg(long)]
     explicit_clifford: bool,
+
+    /// Materialize only the Cliffords that came from a *correction*, absorbing
+    /// the circuit's own Cliffords into the measurement frame as usual. The
+    /// middle ground between the default and --explicit-clifford: every emitted
+    /// measurement's Pauli string is fixed at compile time (only its sign, and
+    /// whether a correction gadget runs at all, depend on measurement outcomes),
+    /// at a fraction of the gadget count of --explicit-clifford. Only has an
+    /// effect together with --simulate-corrections, which is what puts the
+    /// conditional rotations in the circuit. (`--mode compile` only.) With
+    /// --intermediates, also writes pbc_hybrid_clifford.txt.
+    #[arg(long, conflicts_with = "explicit_clifford")]
+    hybrid: bool,
 
     /// Use SAT-based optimal partitioner (max_k and initial bound learned from greedy).
     /// Implies --skip-redundant-ls (required for Belady's optimality guarantee).
@@ -360,6 +375,23 @@ fn main() {
                 ],
                 pbc_final,
             )
+        } else if cli.hybrid {
+            let (load_store, pbc_pre, hybrid, pbc_final) = compile_hybrid_steps(
+                circuit,
+                proc_cap,
+                cli.simulate_corrections,
+                skip_redundant,
+                cli.sat,
+                cli.sat_timeout,
+            );
+            (
+                vec![
+                    ("load_store.txt", load_store.to_string()),
+                    ("pbc_w_clifford.txt", pbc_pre.to_string()),
+                    ("pbc_hybrid_clifford.txt", hybrid.to_string()),
+                ],
+                pbc_final,
+            )
         } else {
             let (load_store, pbc_pre, pbc_final) = compile_steps(
                 circuit,
@@ -387,6 +419,15 @@ fn main() {
         pbc_final
     } else if cli.explicit_clifford {
         compile_explicit_clifford(
+            circuit,
+            proc_cap,
+            cli.simulate_corrections,
+            skip_redundant,
+            cli.sat,
+            cli.sat_timeout,
+        )
+    } else if cli.hybrid {
+        compile_hybrid(
             circuit,
             proc_cap,
             cli.simulate_corrections,

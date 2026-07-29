@@ -258,7 +258,7 @@ pub type CodePauli<K> = PauliAxis<CodeQubit<K>>;
 
 /// A qubit of the merged surgery code: either an `EdgeQubit` (ancilla / edge
 /// qubit, keyed by edge id) or an original `CodeQubit` of a code block.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum MergedCodeQubit<K> {
     EdgeQubit(usize),
     CodeQubit { block: K, index: usize },
